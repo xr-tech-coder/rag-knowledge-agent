@@ -24,11 +24,9 @@ import time
 import retrieval as R
 
 API_KEY = (os.getenv("API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
-BASE_URL = os.getenv(
-    "BASE_URL",
-    "https://ws-rgi549ol413mnbmz.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-)
-MODEL = os.getenv("MODEL", "qwen3.6-plus")
+# 默认指向公开接口；换服务商就设环境变量 BASE_URL，不要把私有地址写进代码
+BASE_URL = os.getenv("BASE_URL", "https://api.deepseek.com")
+MODEL = os.getenv("MODEL", "deepseek-chat")
 THINK = os.getenv("THINK", "0")  # 客服场景默认关思考：首字 35s → 0.9s
 
 # 价格（元 / 百万 token）。按你实际模型改，算成本才准。

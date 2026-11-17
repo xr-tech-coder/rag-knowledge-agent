@@ -16,11 +16,9 @@ import time
 
 # ============ 配置（改这里就够了）============
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "").strip()
-BASE_URL = os.getenv(
-    "BASE_URL",
-    "https://ws-rgi549ol413mnbmz.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-)
-MODEL = os.getenv("MODEL", "qwen3.6-plus")
+# 默认指向公开接口；换服务商就设环境变量 BASE_URL，不要把私有地址写进代码
+BASE_URL = os.getenv("BASE_URL", "https://api.deepseek.com")
+MODEL = os.getenv("MODEL", "deepseek-chat")
 
 # 价格按你实际用的模型改，单位：元 / 百万 token
 # 不确定就去官网查一次，写死在这里，以后算成本都用它
