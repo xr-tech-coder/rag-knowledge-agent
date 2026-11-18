@@ -21,12 +21,13 @@ OVERLAP = 80          # 相邻段重叠字数，防止一句话被切断
 TOP_K = 3             # 取前几段
 
 # 拒答阈值：检索最高分低于这个数，就认为「库里没有能回答的资料」，应该拒答。
-# ⚠ 这个值很脆弱，实测依据（19 个片段、BM25 纯关键词）：
-#     库内题最低分 3.06（第 3 题，多跳题）
-#     库外题最高分 2.70（第 11 题）
-#   两者只差 0.36 —— 阈值往左挪一点，库外题被当成有答案；往右挪一点，库内题被拒答。
-#   这说明「用绝对分数判拒答」在小数据量 + 纯 BM25 下不可靠。
-#   真正的解法是后面加向量检索 + 重排，用重排分数判（分数分布拉得开），或交给生成层判断。
+# ⚠ 实测（20 个片段、50 题、纯 BM25）：
+#     库内题最低分 2.14
+#     库外题最高分 2.85
+#   区分度 = 2.14 - 2.85 = -0.71（负数），库外题的分数反而更高。
+#   结论：纯 BM25 + 小数据量下，「用绝对分数判拒答」这条路是死的，不是调参能救的。
+#   现在的拒答由生成层决定（prompt 规则 2 / 5 / 6），不靠这个阈值。
+#   保留它只为 run_golden 统计「库外题分数有没有高到危险」，不作为线上判定。
 REFUSE_THRESHOLD = 3.0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +86,8 @@ def run_golden(bm25, chunks):
         cases = json.load(f)
 
     n_in = n_in_ok = 0          # 库内题（有标准答案）
+    n_top1_ok = 0               # 其中「第 1 名来源就对」的题数
+    vol_total = 0               # 库内题取回文本的总字数，用来算平均
     n_out = n_out_ok = 0        # 库外题（应当拒答）
     in_min_top1 = None          # 库内题里最低的最高分，用来对照阈值是否合理
     out_top1 = []
@@ -117,14 +120,30 @@ def run_golden(bm25, chunks):
         # ---------- 库内题：来源全中 + 关键词命中 ----------
         n_in += 1
         want_src = case.get("expected_sources", [])
-        want_kw = case.get("expected_keyword", "")
 
         got_src = [s for s, _, _ in hits]
         got_text = " ".join(t for _, _, t in hits)
+        vol_total += len(got_text)
 
         # 用 all() 而不是任何一道命中：多跳题必须两份文档都取到才算过
         src_ok = all(s in got_src for s in want_src)
-        kw_ok = (want_kw in got_text) if want_kw else True
+
+        # top1 正确 = 第 1 名的来源就在期望来源里。
+        # 这个指标替代不了「通过」，因为多跳题要求两份文档同时在场；
+        # 但它测的是排序质量，而排序质量没法靠「多给资料」刷高（第 1 名只有一个）。
+        top1_ok = bool(want_src) and hits[0][0] in want_src
+        n_top1_ok += top1_ok
+
+        # 关键词两种写法，与 rag.py 的 judge() 保持同一套口径：
+        #   expected_keyword      单值，必须原样出现
+        #   expected_keyword_any  列表，命中任一即可（同一个答案的不同说法）
+        if case.get("expected_keyword_any"):
+            want_kw = " / ".join(case["expected_keyword_any"])
+            kw_ok = any(k in got_text for k in case["expected_keyword_any"])
+        else:
+            want_kw = case.get("expected_keyword", "")
+            kw_ok = (want_kw in got_text) if want_kw else True
+
         ok = src_ok and kw_ok
         n_in_ok += ok
 
@@ -132,7 +151,10 @@ def run_golden(bm25, chunks):
             in_min_top1 = top1
 
         flag = "✅" if ok else "❌"
-        print(f"{i:2d}. {flag} {q[:32]:<34s} 来源{'✓' if src_ok else '✗'} 关键词{'✓' if kw_ok else '✗'}")
+        # 来源进了 top3 却没排第一：能答对是靠模型自己往后翻，换个模型就未必
+        warn = "  ⚠ 进了没排对" if (src_ok and not top1_ok) else ""
+        print(f"{i:2d}. {flag} {q[:30]:<32s} 来源{'✓' if src_ok else '✗'} "
+              f"关键词{'✓' if kw_ok else '✗'} top1{'✓' if top1_ok else '✗'}{warn}")
         if not src_ok:
             print(f"     期望 {want_src}，实际 {got_src}")
         if not kw_ok:
@@ -143,6 +165,11 @@ def run_golden(bm25, chunks):
     print(f"库内题：{n_in_ok}/{n_in} 通过 ({n_in_ok / n_in * 100:.0f}%)")
     if n_out:
         print(f"拒答题：{n_out_ok}/{n_out} 正确拒答 ({n_out_ok / n_out * 100:.0f}%)")
+    if n_in:
+        print(f"top1 正确：{n_top1_ok}/{n_in} ({n_top1_ok / n_in * 100:.0f}%) "
+              f"| 平均取回 {vol_total // n_in} 字")
+        print("   ↑ 「通过」能被多给资料刷高（字多，关键词更容易撞上）；")
+        print("     top1 正确率刷不了（第 1 名只有一个）。三个数一起看，才分得清真变好还是换代价。")
 
     if in_min_top1 is not None and out_top1:
         gap = in_min_top1 - max(out_top1)
@@ -152,7 +179,7 @@ def run_golden(bm25, chunks):
             print("  必须靠向量检索 + 重排把分数分布拉开，或交给生成层判断。别在这里继续调阈值。")
         else:
             print(f"  区分度 {gap:.2f} 分，阈值有参考价值。")
-    print("\n这两个数就是你的基线。以后每改一处（切分/加向量/加重排），回来跑一次对比。")
+    print("\n这四个数就是你的基线。以后每改一处（切分/加向量/加重排），回来跑一次对比。")
 
 
 def main():
