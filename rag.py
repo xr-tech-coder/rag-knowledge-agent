@@ -219,6 +219,25 @@ def report(info):
             print(f"  [{i}] {src}  (分数 {score:.2f})")
 
 
+# 比对关键词前先删掉的东西：空白 + 纯排版用的标点。
+# 它们不承载语义，但会让「答案正确」被判成「没答出来」。实测踩过两次：
+#   · 文档表格写「1–2 天」，模型答「1–2天」      → 空格差异
+#   · 期望「可退可换可修」，模型答「（可退、可换、可修）」→ 顿号括号差异
+# 不删的：数字、连字符（3–7 不能变成 37）、以及任何字词。
+_KW_STRIP = str.maketrans("", "", " \t\n\r、，,。．；;：:（）()【】[]·\"'“”‘’")
+
+
+def _kw_hit(keyword, answer):
+    """关键词是否命中：先按字面比，不中就删掉空白和排版标点再比。
+
+    只放宽符号，不放宽内容 —— 反例「把 1–2 天答成 3–5 天」仍然判失败（已回放验证）。
+    注意：红线（must_not_contain）和错值检查不吃这套，那两层宁可错杀。
+    """
+    if keyword in answer:
+        return True
+    return keyword.translate(_KW_STRIP) in answer.translate(_KW_STRIP)
+
+
 def judge(case, answer, hits=None):
     """生成层判定：只看模型说了什么。
 
@@ -243,14 +262,14 @@ def judge(case, answer, hits=None):
         return False, "❌ 库内题却答「资料未提供」，等于放弃作答"
 
     kw = case.get("expected_keyword", "")
-    if kw and kw not in answer:
+    if kw and not _kw_hit(kw, answer):
         return False, f"❌ 缺关键词「{kw}」"
 
     # 有些题答案有多种正确表述（「可付费维修」/「不属于质量问题」都算对），
     # 单关键词会因措辞不同判成假失败。这些题改用 expected_keyword_any：命中任一即可。
     # 注意：列表里只放「核心判断」，不要放宽泛词，否则等于取消这条检查。
     anys = case.get("expected_keyword_any") or []
-    if anys and not any(w in answer for w in anys):
+    if anys and not any(_kw_hit(w, answer) for w in anys):
         return False, f"❌ 没有命中任何应有表述：{anys}"
 
     # 版本冲突题专用：答了旧版本/错值也算错（如现行 15 天，答 7 天内）

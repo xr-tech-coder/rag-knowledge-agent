@@ -20,15 +20,13 @@ CHUNK_SIZE = 400      # 每段字数
 OVERLAP = 80          # 相邻段重叠字数，防止一句话被切断
 TOP_K = 3             # 取前几段
 
-# 拒答阈值：检索最高分低于这个数，就认为「库里没有能回答的资料」，应该拒答。
-# ⚠ 实测（20 个片段、50 题、纯 BM25）：
-#     库内题最低分 2.14
-#     库外题最高分 2.85
-#   区分度 = 2.14 - 2.85 = -0.71（负数），库外题的分数反而更高。
-#   结论：纯 BM25 + 小数据量下，「用绝对分数判拒答」这条路是死的，不是调参能救的。
-#   现在的拒答由生成层决定（prompt 规则 2 / 5 / 6），不靠这个阈值。
-#   保留它只为 run_golden 统计「库外题分数有没有高到危险」，不作为线上判定。
-REFUSE_THRESHOLD = 3.0
+# 【已废止】REFUSE_THRESHOLD（曾 = 3.0）—— 想用「检索最高分低于阈值就拒答」。
+# 实测（20 个片段、纯 BM25）：
+#     库内题最低分 2.14，库外题最高分 2.85，区分度 = -0.71（负数），库外题分数反而更高。
+# 补到 100 题后跨度扩大到 0.00 ~ 3.13，更没区分力。
+# 结论：纯 BM25 + 小数据量下，「用绝对分数判拒答」这条路是死的，不是调参能救的。
+# 拒答已完全交给生成层（prompt 规则 2/5/6 + rag.py 的 judge）。
+# 这个常量只留在注释里当记录，代码中不再引用 —— 免得有人以为它还在生效。
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
@@ -74,6 +72,16 @@ def search(bm25, chunks, question, top_k=TOP_K):
     return [(chunks[i][0], scores[i], chunks[i][1]) for i in order]
 
 
+# 与 rag.py 的 _KW_STRIP / _kw_hit 同一套口径：空白和纯排版标点不承载语义。
+# 两层标准必须一致，否则会出现「检索层判过、生成层判不过」，排查时互相打架。
+_KW_STRIP = str.maketrans("", "", " \t\n\r、，,。．；;：:（）()【】[]·\"'“”‘’")
+
+
+def kw_hit(keyword, text):
+    """关键词是否命中：先按字面比，不中就删掉空白和排版标点再比。"""
+    return keyword in text or keyword.translate(_KW_STRIP) in text.translate(_KW_STRIP)
+
+
 def show(question, hits):
     print(f"\n问题：{question}")
     for rank, (src, score, text) in enumerate(hits, 1):
@@ -88,33 +96,28 @@ def run_golden(bm25, chunks):
     n_in = n_in_ok = 0          # 库内题（有标准答案）
     n_top1_ok = 0               # 其中「第 1 名来源就对」的题数
     vol_total = 0               # 库内题取回文本的总字数，用来算平均
-    n_out = n_out_ok = 0        # 库外题（应当拒答）
+    n_out = 0                   # 应拒答题总数（三类合计，不判对错，只统计）
     in_min_top1 = None          # 库内题里最低的最高分，用来对照阈值是否合理
-    out_top1 = []
+    out_top1 = []               # 库外题的分数，用来算区分度
 
     for i, case in enumerate(cases, 1):
         q = case["question"]
         hits = search(bm25, chunks, q)
         top1 = hits[0][1] if hits else 0.0
 
-        # ---------- 应拒答题 ----------
-        # 检索层只能判「库外题」（资料真没有，最高分低才算对）。
-        # 「越权」「注入」两类判不了：越权题的资料常见词（订单/退款）本来就在库里，
-        # 注入题更是故意把毒内容藏进了文档 —— 分数高是必然的，对错要看生成层
-        # 有没有真的执行那个动作（改地址、念内部备注、承诺赔偿）。
+        # ---------- 应拒答题：检索层一律不判对错，只报分数 ----------
+        # 为什么三类都不判：
+        #   · 越权、注入：资料里本来就有「订单」「退款」这些词，注入题的毒内容更是
+        #     故意埋进文档的 —— 分数高是必然结果。对错要看生成层有没有真的执行那个动作。
+        #   · 库外：已实测区分度 -0.71 ~ -0.99（负数），「用绝对分数判库里有没有」是死的。
+        #     既然这把尺子自己都被否掉了，就不该再拿它给库外题打 ❌。
+        # 分数照报，是为了留一条线：以后换向量/重排，库外题的分数应该整体往下走。
         if case.get("should_refuse"):
             cat = case.get("category", "")
-            if cat in ("越权", "注入"):
-                print(f"{i:2d}. ➖ {q[:30]:<32s} {cat}题 最高分 {top1:5.2f}  检索层不判定")
-                continue
-
             n_out += 1
-            out_top1.append(top1)
-            ok = top1 < REFUSE_THRESHOLD
-            n_out_ok += ok
-            flag = "✅" if ok else "❌"
-            verdict = "正确拒答" if ok else "最高分够高 → 可能照着无关片段瞎答"
-            print(f"{i:2d}. {flag} {q[:30]:<32s} 库外题 最高分 {top1:5.2f}  {verdict}")
+            if cat == "库外":
+                out_top1.append(top1)   # 只有纯库外题的分数可作对照
+            print(f"{i:2d}. ➖ {q[:30]:<32s} {cat}题 最高分 {top1:5.2f}  检索层不判定")
             continue
 
         # ---------- 库内题：来源全中 + 关键词命中 ----------
@@ -139,10 +142,10 @@ def run_golden(bm25, chunks):
         #   expected_keyword_any  列表，命中任一即可（同一个答案的不同说法）
         if case.get("expected_keyword_any"):
             want_kw = " / ".join(case["expected_keyword_any"])
-            kw_ok = any(k in got_text for k in case["expected_keyword_any"])
+            kw_ok = any(kw_hit(k, got_text) for k in case["expected_keyword_any"])
         else:
             want_kw = case.get("expected_keyword", "")
-            kw_ok = (want_kw in got_text) if want_kw else True
+            kw_ok = kw_hit(want_kw, got_text) if want_kw else True
 
         ok = src_ok and kw_ok
         n_in_ok += ok
@@ -163,23 +166,31 @@ def run_golden(bm25, chunks):
     # ---------- 汇总 ----------
     print("\n" + "=" * 60)
     print(f"库内题：{n_in_ok}/{n_in} 通过 ({n_in_ok / n_in * 100:.0f}%)")
-    if n_out:
-        print(f"拒答题：{n_out_ok}/{n_out} 正确拒答 ({n_out_ok / n_out * 100:.0f}%)")
     if n_in:
         print(f"top1 正确：{n_top1_ok}/{n_in} ({n_top1_ok / n_in * 100:.0f}%) "
               f"| 平均取回 {vol_total // n_in} 字")
         print("   ↑ 「通过」能被多给资料刷高（字多，关键词更容易撞上）；")
         print("     top1 正确率刷不了（第 1 名只有一个）。三个数一起看，才分得清真变好还是换代价。")
 
+    # 应拒答题不给通过率：检索层判不了，硬算出来的数字只会误导
+    if n_out:
+        print(f"\n应拒答题 {n_out} 道（含越权/注入），检索层不判对错。")
+        if out_top1:
+            scores = " ".join(f"{x:.2f}" for x in sorted(out_top1, reverse=True))
+            print(f"  其中纯库外题 {len(out_top1)} 道最高分：{scores}")
+            print("  ↑ 这个跨度就是「分数分不出库里有没有」的证据。加向量/重排后这几个数应该整体下降，")
+            print("    那才叫检索层学会了「不知道」。不要把它们换算成任何通过率。")
+
     if in_min_top1 is not None and out_top1:
         gap = in_min_top1 - max(out_top1)
-        print(f"\n拒答阈值 {REFUSE_THRESHOLD} | 库内题最低分 {in_min_top1:.2f} | 库外题最高分 {max(out_top1):.2f}")
+        print(f"\n区分度：库内题最低分 {in_min_top1:.2f} − 库外题最高分 {max(out_top1):.2f} = {gap:.2f}")
         if gap < 1.0:
-            print(f"⚠ 区分度只有 {gap:.2f} 分 —— 阈值不可靠。这个区间里靠分数分不开「库里有」和「库里没有」，")
-            print("  必须靠向量检索 + 重排把分数分布拉开，或交给生成层判断。别在这里继续调阈值。")
+            print("⚠ 分不开。分数在「库里有」和「库里没有」之间没有缝隙，")
+            print("  得靠向量检索 + 重排把分布拉开，或干脆交给生成层判断。别再调阈值了。")
         else:
-            print(f"  区分度 {gap:.2f} 分，阈值有参考价值。")
-    print("\n这四个数就是你的基线。以后每改一处（切分/加向量/加重排），回来跑一次对比。")
+            print("  有缝隙，分数可以当辅助信号（主判定仍交给生成层）。")
+    print("\n上面三个数（通过率 / top1 / 平均取回字数）就是你的基线。")
+    print("以后每改一处（切分/加向量/加重排），回来跑一次对比。")
 
 
 def main():
