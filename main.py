@@ -19,6 +19,8 @@ API_KEY = os.getenv("DASHSCOPE_API_KEY", "").strip()
 # 默认指向公开接口；换服务商就设环境变量 BASE_URL，不要把私有地址写进代码
 BASE_URL = os.getenv("BASE_URL", "https://api.deepseek.com")
 MODEL = os.getenv("MODEL", "deepseek-chat")
+# 固定温度，和 rag.py 保持一致，否则「裸模型 vs RAG」的对比里混了采样噪声
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.1"))
 
 # 价格按你实际用的模型改，单位：元 / 百万 token
 # 不确定就去官网查一次，写死在这里，以后算成本都用它
@@ -59,8 +61,13 @@ def main() -> None:
 
     # 关思考开关：默认开着。想关就设 THINK=0（Qwen3 支持 enable_thinking=False）
     no_think = os.getenv("THINK", "1").strip().lower() in ("0", "false", "no", "off")
-    extra = {"extra_body": {"enable_thinking": False}} if no_think else {}
-    print(f"model={MODEL} | thinking={'关闭' if no_think else '开启(默认)'}")
+    extra = {"temperature": TEMPERATURE}
+    if no_think:
+        extra["extra_body"] = {"enable_thinking": False}
+    print(
+        f"model={MODEL} | temperature={TEMPERATURE} | "
+        f"thinking={'关闭' if no_think else '开启(默认)'}"
+    )
 
     # ---------- 1) 非流式：等全部生成完才返回 ----------
     t0 = time.perf_counter()
