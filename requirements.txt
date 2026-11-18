@@ -4,5 +4,9 @@ openai>=1.30
 # 第 1 层：本地关键词检索（W1 用）
 rank_bm25
 
-# 第 2 层：界面（W1 用）
+# 第 2 层：混合检索（BM25 + 向量，RRF 融合）
+# numpy 本来是 rank_bm25 的传递依赖，但 hybrid.py 直接 import 了它，显式写出来
+numpy
+
+# 第 3 层：界面（W1 用）
 streamlit

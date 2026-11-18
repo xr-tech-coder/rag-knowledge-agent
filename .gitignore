@@ -22,3 +22,6 @@ Thumbs.db
 tmp/
 
 backups/
+
+# 向量缓存：二进制产物，谁跑谁生成，不进仓库
+eval/.vec_cache.npz
