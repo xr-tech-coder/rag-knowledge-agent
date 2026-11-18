@@ -21,6 +21,7 @@
     "question": "现在降价了还能补差价吗？多少天内？",
     "expected_sources": ["05-价格保护与优惠券.md"],
     "expected_keyword": "15",
+    "must_not_contain_value": ["7 天内", "7天内", "七天内"],
     "note": "版本冲突：2026 版 15 天，2025 版 7 天已废止"
   },
   {
