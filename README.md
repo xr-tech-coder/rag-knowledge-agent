@@ -55,8 +55,9 @@ $env:BASE_URL = "https://api.deepseek.com"
 | 文件                   | 作用                                                                                                           |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `data/`                | 知识库，10 份 md，按 `NN-主题.md` 命名，编号只是排序用，与文档 ID 解耦                                         |
-| `eval/golden_set.json` | 15 题评测集。字段：`question` / `expected_sources` / `expected_keyword` / `should_refuse` / `must_not_contain` |
+| `eval/golden_set.json` | 50 题评测集，分五层（基础事实 / 边界 / 库外 / 越权 / 注入）。字段：`question` / `category` / `expected_sources` / `expected_keyword` / `should_refuse` / `must_not_contain` |
 | `retrieval.py`         | 切段 + BM25 检索 + 检索层评测。**不依赖模型，随时可跑**，是所有改动的回归基线                                  |
+| `hybrid.py`            | 混合检索实验：BM25 / 纯向量 / RRF 融合三模式对比。**尚未接入主链路**，结论见 [`docs/实验记录.md`](docs/实验记录.md) |
 | `rag.py`               | 检索 + 拼 context + 流式生成 + 引用编号。端到端入口                                                            |
 | `main.py`              | 裸模型对照实验：不检索、不带资料。用来量化"RAG 到底补了什么"                                                   |
 | `diag_stream.py`       | 流式/首字时延诊断，见 [`docs/流式诊断.md`](docs/流式诊断.md)                                                   |
@@ -80,6 +81,8 @@ $env:BASE_URL = "https://api.deepseek.com"
 **没通过的 2 题如实列出**：第 22 题「满多少钱包邮」、第 24 题「运费险最多能赔多少」。答案都在 `04-运费规则.md` 里，但都没被召回——根因见下面「已知缺陷」。
 
 顺带一个负向结论：库内题最低分 2.14，库外题最高分 2.85，**区分度 -0.71**。想用「检索分数低于阈值就拒答」这条路是不通的，两个分布叠在一起。
+
+**混合检索实验（`hybrid.py`，未接入主链路）**：BM25 + 向量 + RRF 融合把这两题都救回来了，库内 **38/38**；但纯向量单独用只有 34/38，且新坏的全是需要精确条件组合的边界题。完整对比和「为什么 top1 仍然是错的」见 [`docs/实验记录.md`](docs/实验记录.md)。
 
 ### 生成层（`rag.py --golden`，端到端，含模型调用）
 
