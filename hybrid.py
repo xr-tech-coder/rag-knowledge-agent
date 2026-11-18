@@ -33,11 +33,18 @@ TOP_K = R.TOP_K
 
 # ---------------- 向量 ----------------
 def _client():
+    """拿 embedding 客户端。
+
+    注意这里抛 RuntimeError 而不是 sys.exit()：这个模块会被 rag.py 引用，
+    配置缺失时应该让调用方有机会降级回 BM25，而不是把整个进程杀掉。
+    """
     key = os.getenv("API_KEY") or os.getenv("DASHSCOPE_API_KEY")
     if not key:
-        sys.exit("缺少 API_KEY / DASHSCOPE_API_KEY")
+        raise RuntimeError("缺少 API_KEY / DASHSCOPE_API_KEY，无法调用 embedding")
     if not EMBED_BASE_URL:
-        sys.exit("缺少 EMBED_BASE_URL（或 BASE_URL）。注意默认的 deepseek 端点没有 embedding 接口。")
+        raise RuntimeError(
+            "缺少 EMBED_BASE_URL（或 BASE_URL）。注意默认的 deepseek 端点没有 embedding 接口。"
+        )
     return OpenAI(api_key=key, base_url=EMBED_BASE_URL)
 
 
@@ -45,7 +52,7 @@ def _key(text):
     return hashlib.sha1((EMBED_MODEL + "|" + text).encode("utf-8")).hexdigest()[:20]
 
 
-def embed(texts):
+def embed(texts, quiet=False):
     """返回 (n, d) 矩阵。带本地缓存，同一段文本不会重复计费。"""
     cache = {}
     if os.path.exists(CACHE):
@@ -61,9 +68,10 @@ def embed(texts):
             resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
             for text, item in zip(batch, resp.data):
                 cache[_key(text)] = np.asarray(item.embedding, dtype=np.float32)
-            print(f"  嵌入 {min(i + 10, len(todo))}/{len(todo)} 条（新调用）")
+            if not quiet:
+                print(f"  嵌入 {min(i + 10, len(todo))}/{len(todo)} 条（新调用）")
         np.savez(CACHE, **cache)
-    else:
+    elif not quiet:
         print(f"  全部命中缓存（{len(texts)} 条），本次零成本")
 
     return np.vstack([cache[_key(t)] for t in texts])

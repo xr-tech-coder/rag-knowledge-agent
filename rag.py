@@ -92,6 +92,33 @@ def build_context(hits):
     return "\n\n---\n\n".join(lines)
 
 
+# ============ 混合检索（BM25 + 向量，RRF 融合）============
+# 默认关闭：HYBRID=0 时行为和之前完全一致，先保证"没改坏"，再谈"改好了"。
+HYBRID = os.getenv("HYBRID", "0")
+VECS = None              # 片段向量矩阵；初始化失败或未启用时为 None
+RETRIEVE_MODE = "bm25"   # 本次实际生效的检索方式，只用于日志
+
+
+def init_vectors():
+    """算好片段向量。失败了不致命 —— 返回异常给调用方，调用方退回 BM25。"""
+    global VECS
+    import hybrid
+    VECS = hybrid.embed([t for _, t in CHUNKS], quiet=True)
+    return len(VECS)
+
+
+def retrieve(question):
+    """检索唯一入口：向量就绪就走融合，否则一律退回纯 BM25。"""
+    global RETRIEVE_MODE
+    if HYBRID == "1" and VECS is not None:
+        import hybrid
+        qv = hybrid.embed([question], quiet=True)[0]
+        RETRIEVE_MODE = "hybrid"
+        return hybrid.search_hybrid(BM25, CHUNKS, question, VECS, qv)
+    RETRIEVE_MODE = "bm25"
+    return R.search(BM25, CHUNKS, question)
+
+
 def ask(question, show_retrieval=True):
     """一次完整的 RAG 问答。返回 (答案, 用量信息, 检索结果)。"""
     from openai import OpenAI
@@ -99,13 +126,17 @@ def ask(question, show_retrieval=True):
     t0 = time.perf_counter()
 
     # ---------- 第 1 步：检索 ----------
-    hits = R.search(BM25, CHUNKS, question)
+    hits = retrieve(question)
     t_retrieval = time.perf_counter() - t0
 
     if show_retrieval:
-        print("检索到：")
+        print(f"检索到（{'BM25+向量融合' if RETRIEVE_MODE == 'hybrid' else 'BM25'}）：")
         for i, (src, score, _t) in enumerate(hits, 1):
-            print(f"  [{i}] {src:<26s} 分数 {score:5.2f}")
+            if RETRIEVE_MODE == "hybrid":
+                # RRF 分数只反映名次，绝对值没有意义（0.03 这种量级是正常的）
+                print(f"  [{i}] {src:<26s} 融合分 {score:.4f}")
+            else:
+                print(f"  [{i}] {src:<26s} 分数 {score:5.2f}")
         print()
 
     context = build_context(hits)
@@ -182,7 +213,10 @@ def report(info):
     )
     print("引用来源：")
     for i, (src, score, _t) in enumerate(info["hits"], 1):
-        print(f"  [{i}] {src}  (分数 {score:.2f})")
+        if RETRIEVE_MODE == "hybrid":
+            print(f"  [{i}] {src}  (融合分 {score:.4f}，只反映名次)")
+        else:
+            print(f"  [{i}] {src}  (分数 {score:.2f})")
 
 
 def judge(case, answer, hits=None):
@@ -311,7 +345,18 @@ def main():
     CHUNKS = R.load_chunks()
     BM25 = R.build_index(CHUNKS)
     print(f"知识库：{len(set(s for s, _ in CHUNKS))} 份文档，{len(CHUNKS)} 个片段")
-    print(f"模型：{MODEL}  思考：{'开' if THINK == '1' else '关'}\n")
+    print(f"模型：{MODEL}  思考：{'开' if THINK == '1' else '关'}")
+
+    # 混合检索：启用时才算向量；算不出来就降级，不让整个问答挂掉
+    if HYBRID == "1":
+        try:
+            n = init_vectors()
+            print(f"检索：BM25 + 向量融合（RRF），{n} 条片段向量")
+        except Exception as e:
+            print(f"⚠ 向量初始化失败，已降级为纯 BM25：{e}")
+    else:
+        print("检索：纯 BM25")
+    print()
 
     args = sys.argv[1:]
 
