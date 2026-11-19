@@ -25,3 +25,7 @@ backups/
 
 # 向量缓存：二进制产物，谁跑谁生成，不进仓库
 eval/.vec_cache.npz
+
+# 本地模型权重与依赖缓存：1GB 级，绝不进仓库
+.models/
+.cache/

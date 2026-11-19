@@ -95,12 +95,14 @@ def search_vec(bm25, chunks, q, vecs, qv):
     return [(chunks[i][0], float(scores[i]), chunks[i][1]) for i in order]
 
 
-def search_hybrid(bm25, chunks, q, vecs, qv):
+def search_hybrid(bm25, chunks, q, vecs, qv, k=None):
     """RRF：只用排名，不用分数。
 
     为什么不直接加权平均：BM25 分数是无界的（0~30+），余弦是 0~1，
     两者量纲不同，加权系数就是硬凑的超参，换个数据集就失效。
     RRF 只看「在各自榜单里排第几」，天然免疫量纲问题。
+
+    k 默认取 TOP_K。重排实验要先把候选池放大到 10，所以留了这个参数。
     """
     s_bm = np.asarray(bm25.get_scores(R.tokenize(q)), dtype=float)
     s_vc = cosine(vecs, qv)
@@ -110,7 +112,7 @@ def search_hybrid(bm25, chunks, q, vecs, qv):
         for rank, idx in enumerate(np.argsort(-scores)):
             fused[idx] += 1.0 / (RRF_K + rank + 1)
 
-    order = np.argsort(-fused)[:TOP_K]
+    order = np.argsort(-fused)[:k or TOP_K]
     return [(chunks[i][0], float(fused[i]), chunks[i][1]) for i in order]
 
 
@@ -150,14 +152,14 @@ def evaluate(search_fn, cases, chunks, bm25, vecs, qvecs):
 
         if case.get("expected_keyword_any"):
             kws = case["expected_keyword_any"]
-            kw_ok = any(k in got_text for k in kws)
+            kw_ok = any(R.kw_hit(k, got_text) for k in kws)
         else:
             kw = case.get("expected_keyword", "")
             kws = [kw] if kw else []
-            kw_ok = (kw in got_text) if kw else True
+            kw_ok = R.kw_hit(kw, got_text) if kw else True
 
         top1_hit += hits[0][0] in want_src
-        kw_right += (any(k in " ".join(t for s, _, t in hits if s in want_src) for k in kws)
+        kw_right += (any(R.kw_hit(k, " ".join(t for s, _, t in hits if s in want_src)) for k in kws)
                      if kws else 1)
         vol += sum(len(t) for _, _, t in hits)
 

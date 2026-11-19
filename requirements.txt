@@ -10,3 +10,8 @@ numpy
 
 # 第 3 层：界面（W1 用）
 streamlit
+
+# 第 4 层：重排实验（rerank.py / RERANK=1）。只有开重排才需要，
+# 会连带装 torch（CPU 版约 220MB）——不跑重排可以不装。
+# 模型权重约 471MB，放 .models/（已 gitignore）；没有会自动联网下载。
+sentence-transformers

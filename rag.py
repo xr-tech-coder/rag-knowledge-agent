@@ -107,16 +107,72 @@ def init_vectors():
     return len(VECS)
 
 
+# ============ 重排（cross-encoder）============
+# 默认关闭，理由和 HYBRID 一样：默认值选最稳的，不选分数最高的。
+# 实验结论（100 题）：召回已经 78/78 全中，重排只能修 top1（76 → 78/78），
+# 通过率一点不动，代价是每题 +828ms（CPU 6 线程）。线上 2 核只会更慢。
+# 所以它留在代码里当开关，不作为默认路径 —— 面试要讲的那句话是：
+# "召回解决有没有，重排才解决排第几"，不是"加了重排分数更高"。
+RERANK = os.getenv("RERANK", "0")
+CAND_K = int(os.getenv("CAND_K", "10"))   # 候选池：先粗排 10 个，再精排
+RERANKER = None            # 懒加载：不开 RERANK 就不 import torch，启动速度不受影响
+RERANK_MODEL_USED = ""     # 实际用上的模型/目录，只用于日志
+_RERANK_FAILED = False     # 加载失败只记一次，别每题都去重试一遍
+
+
+def init_reranker():
+    """加载 cross-encoder。失败返回 None，调用方退回未重排的结果。
+
+    不在 import 时加载：sentence-transformers + torch 要几百毫秒到几秒，
+    而 RERANK 默认是关的 —— 为了一个不用的功能拖慢每次启动不值得。
+    """
+    global RERANKER, RERANK_MODEL_USED, _RERANK_FAILED
+    if RERANKER is not None or _RERANK_FAILED:
+        return RERANKER
+    try:
+        import rerank as RR
+        RERANKER, RERANK_MODEL_USED = RR.load_reranker()
+        return RERANKER
+    except Exception as e:
+        _RERANK_FAILED = True
+        print(f"⚠ 重排模型加载失败，已降级为不重排：{type(e).__name__}: {e}")
+        return None
+
+
 def retrieve(question):
-    """检索唯一入口：向量就绪就走融合，否则一律退回纯 BM25。"""
+    """检索唯一入口：向量就绪就走融合，否则退回纯 BM25；开了重排再精排一层。
+
+    开启重排时候选池要放大到 CAND_K —— 只召回 3 个再重排，等于没有排序空间。
+    """
     global RETRIEVE_MODE
+    want_k = CAND_K if RERANK == "1" else R.TOP_K
+
     if HYBRID == "1" and VECS is not None:
         import hybrid
         qv = hybrid.embed([question], quiet=True)[0]
+        hits = hybrid.search_hybrid(BM25, CHUNKS, question, VECS, qv, k=want_k)
         RETRIEVE_MODE = "hybrid"
-        return hybrid.search_hybrid(BM25, CHUNKS, question, VECS, qv)
-    RETRIEVE_MODE = "bm25"
-    return R.search(BM25, CHUNKS, question)
+    else:
+        hits = R.search(BM25, CHUNKS, question, top_k=want_k)
+        RETRIEVE_MODE = "bm25"
+
+    if RERANK == "1":
+        model = init_reranker()
+        if model is not None:
+            import rerank as RR
+            hits = RR.rerank(model, question, hits)
+            RETRIEVE_MODE += "+rerank"
+    return hits
+
+
+# 检索方式的显示名。三种分数不能混着报：
+#   BM25 分数无界（0~30+）、RRF 只有 0.0x（只反映名次）、重排分是 logit（只有相对大小有意义）。
+_MODE_LABEL = {
+    "bm25": "BM25",
+    "hybrid": "BM25 + 向量融合",
+    "bm25+rerank": "BM25 → 重排",
+    "hybrid+rerank": "BM25 + 向量 → 重排",
+}
 
 
 def ask(question, show_retrieval=True):
@@ -130,9 +186,12 @@ def ask(question, show_retrieval=True):
     t_retrieval = time.perf_counter() - t0
 
     if show_retrieval:
-        print(f"检索到（{'BM25+向量融合' if RETRIEVE_MODE == 'hybrid' else 'BM25'}）：")
+        print(f"检索到（{_MODE_LABEL.get(RETRIEVE_MODE, RETRIEVE_MODE)}）：")
         for i, (src, score, _t) in enumerate(hits, 1):
-            if RETRIEVE_MODE == "hybrid":
+            if RETRIEVE_MODE.endswith("+rerank"):
+                # 重排分是 cross-encoder 的 logit，不是概率，跨题不可比
+                print(f"  [{i}] {src:<26s} 重排分 {score:6.2f}")
+            elif RETRIEVE_MODE == "hybrid":
                 # RRF 分数只反映名次，绝对值没有意义（0.03 这种量级是正常的）
                 print(f"  [{i}] {src:<26s} 融合分 {score:.4f}")
             else:
@@ -213,7 +272,9 @@ def report(info):
     )
     print("引用来源：")
     for i, (src, score, _t) in enumerate(info["hits"], 1):
-        if RETRIEVE_MODE == "hybrid":
+        if RETRIEVE_MODE.endswith("+rerank"):
+            print(f"  [{i}] {src}  (重排分 {score:.2f}，只有相对大小有意义)")
+        elif RETRIEVE_MODE == "hybrid":
             print(f"  [{i}] {src}  (融合分 {score:.4f}，只反映名次)")
         else:
             print(f"  [{i}] {src}  (分数 {score:.2f})")
@@ -375,6 +436,13 @@ def main():
             print(f"⚠ 向量初始化失败，已降级为纯 BM25：{e}")
     else:
         print("检索：纯 BM25")
+
+    # 重排：开启时在这里就把模型加载好。
+    # 放在启动时而不是第一题：加载要几秒，藏在 golden 循环里会被误算进单题耗时。
+    if RERANK == "1":
+        print(f"重排：开启（候选池 {CAND_K} → 重排 → top{R.TOP_K}）")
+        if init_reranker() is not None:
+            print(f"  模型：{RERANK_MODEL_USED}")
     print()
 
     args = sys.argv[1:]
