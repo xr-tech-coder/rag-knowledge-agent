@@ -116,7 +116,7 @@ TOOLS_SCHEMA = [
                 "properties": {
                     "order_id": {
                         "type": "string",
-                        "description": "订单号，形如 ORD20261101001。用户没提供时先向用户索取，不要编造。",
+                        "description": "订单号，形如 ORD20260000000（ORD + 11 位数字）。用户没提供时先向用户索取，不要编造。",
                     }
                 },
                 "required": ["order_id"],
@@ -135,7 +135,11 @@ TOOLS_SCHEMA = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "string", "description": "订单号，形如 ORD20261101001"}
+                    # 示例单号必须是一个查无此单的号。原来写的是 ORD20261101001，
+                    # 它在 mock 数据里真实存在 —— 用户只说「我的快递到哪了」时，
+                    # 模型把示例当默认值填了进去，工具照单执行，把真实订单捞了出来。
+                    # 示例本身不能是有效数据，否则它就是一个会被抄走的默认参数。
+                    "order_id": {"type": "string", "description": "订单号，形如 ORD20260000000"}
                 },
                 "required": ["order_id"],
             },

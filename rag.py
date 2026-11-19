@@ -17,6 +17,7 @@ D3：完整 RAG —— 检索到 3 段资料，让模型只依据这些资料回
 关键设计：检索层完全复用 retrieval.py，不重复写。
 """
 
+import json
 import os
 import re
 import sys
@@ -67,8 +68,10 @@ SYSTEM_TOOLS = """
    a) 凡涉及「我的订单」「快递到哪了」「我这个单子签收了吗」这类需要具体订单信息的提问，
       必须调用工具查询，不要把资料里的配送时效当成该订单的实际状态。
    b) 用户没给订单号时，先请对方提供订单号，不要编造一个去查。
-   c) 工具返回的是实时数据，直接使用即可，**不需要标引用编号**（它不来自资料）。
-      但据它去引用政策规则时，政策部分仍要标 [n]。
+   c) 工具模式下，回答**不标任何引用编号**。工具给的事实（状态、时间、轨迹、单号）
+      直接陈述；确需提到某项制度时，说出名称即可，不要标 [n]。
+      原因：编号只能指向【资料】片段，工具数据不来自资料 ——
+      给它挂一个编号等于伪造出处，比不标更糟。
    d) 工具说查不到或无权查看时，按规则 5 回答，不要换个订单号猜。"""
 
 # 判定「模型是否表达了拒答」的词。用于库外题评分。
@@ -90,6 +93,19 @@ REFUSE_WORDS = [
     "建议您联系",
     "需要确认",
     "请提供您自己的",
+    # 下面三条是换 flash 后补的：它更常用「走人工」的说法，而不用「无法/不能」。
+    # 三种表述表达的是同一件事 —— 客服不执行、转到人工，都算拒答。
+    "联系人工客服",
+    "协助转接",
+    "需要先查询",
+    # 「资料中未提及 X」是最标准的库外拒答表述，之前词表里只有「未提供」——
+    # 一字之差，qwen3.5-flash 的一句完全正确的拒答被判成「没拒答」。
+    "未提及",
+    "未涉及",
+    # 工具层的标准拒绝话术就是这两句：「该订单号不存在，或不属于当前登录账户」。
+    # 它表达的是「查不到、不能给」，但一个「无法」都没有 —— 词表漏了它照样判成没拒答。
+    "不存在",
+    "不属于",
 ]
 
 # 库内题里出现这些说法 = 模型其实没答，拿「资料里没有」蒙过去。必须判失败。
@@ -102,12 +118,81 @@ HEDGE_WORDS = ["资料中未提供", "没有相关", "没有找到", "未找到"
 HEDGE_MAX_LEN = 40
 
 
+# ---------- 数值抽取：给「数字型答案」用的尺子 ----------
+# 关键词匹配对数字有两处硬伤，实测都能复现：
+#   1. 子串误通过 —— 问「满多少钱包邮」（答 99），一本正经答「满 999 元包邮」判过，
+#      因为 "99" 是 "999" 的子串；
+#   2. 中文数字误失败 —— 答「累计消费一千元」判不过，因为关键词写的是 "1000"。
+# 前者是漏放（更危险），后者是误杀。数字本该与措辞无关，所以按「值」比，不按「字符」比。
+_CN_NUM = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+           "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+
+def _cn_to_int(s):
+    """「十五」→15，「三百二十」→320，「一千」→1000。只到万，够这 10 份文档用。"""
+    total = 0
+    section = 0
+    num = 0
+    for ch in s:
+        if ch in _CN_NUM:
+            num = _CN_NUM[ch]
+        elif ch in _CN_UNIT:
+            u = _CN_UNIT[ch]
+            if u == 10000:
+                total += (section + num) * u
+                section = 0
+            else:
+                section += (num or 1) * u  # 「十五」的十前面省略了一
+            num = 0
+        else:
+            return None
+    return total + section + num
+
+
+def numbers_in(text):
+    """抽出文本里出现的所有数值（阿拉伯与中文混排都收），返回 set[float]。
+
+    两个坑：
+      - 引用编号 [1][2] 不是数值。不剔掉的话，「期望值 1」的题只要标了引用就过。
+      - 千分位 "1,000" 会被逗号拆成 1 和 000。
+    """
+    text = re.sub(r"\[\d+\]", " ", text)
+    out = set()
+    for m in re.finditer(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?", text):
+        out.add(float(m.group().replace(",", "")))
+    for m in re.finditer(r"[零〇一二两三四五六七八九十百千万]+", text):
+        v = _cn_to_int(m.group())
+        if v:
+            out.add(float(v))
+    return out
+
+
 def build_context(hits):
     """把 3 段资料拼成带编号的文本，编号是后面引用 [1][2] 的锚点。"""
     lines = []
     for i, (src, _score, text) in enumerate(hits, 1):
         lines.append(f"[{i}] 来源：{src}\n{text.strip()}")
     return "\n\n---\n\n".join(lines)
+
+
+def _today():
+    """今天的日期，用来给模型一个时间锚点。
+
+    模型本身不知道当天几号，System 里不写它就自己编。实测编成 2026-11-05，
+    于是把「签收已超 7 天」判成「还在 7 天内，您现在可以申请无理由退货」——
+    把一个按规定不能办的事说成能办，比答错政策更危险：
+    「签收满 30 天没」「是否在价保期内」这类题全都靠这个锚点算。
+    """
+    return time.strftime("%Y-%m-%d")
+
+
+def build_user_msg(context, question):
+    """用户消息统一在这里拼，两条问答路径共用，免得只改了一条。
+
+    【今天】放在最前面：它是前提，不是资料，避免模型把日期当成某份文档的内容。
+    """
+    return f"【今天】{_today()}\n\n【资料】\n{context}\n\n【问题】\n{question}"
 
 
 # ============ 混合检索（BM25 + 向量，RRF 融合）============
@@ -282,6 +367,30 @@ def _stream_once(client, messages, tools=None, on_token=None):
     return "".join(pieces), [slots[k] for k in sorted(slots)], usage, first_at
 
 
+def _dispatch_checked(T, call, question):
+    """工具参数校验：模型要查的单号，必须在用户原话里出现过。
+
+    工具层能拦住「越权」，拦不住「凭空造出来的参数」。实测：用户只说了
+    「我的快递到哪了」，模型把 schema 里的示例单号当默认值填进去，工具照单执行，
+    把真实订单数据捞了出来 —— 那次恰好是用户自己的单，换个号就是别人的。
+    这条判断比 schema 措辞硬：prompt 能劝，代码能拦，而这里连工具都还没进。
+
+    成本只有一次字符串比对，不加 token、不加请求。
+    """
+    try:
+        args = json.loads(call["arguments"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return T.dispatch(call["name"], call["arguments"])  # 参数不合法交给 dispatch 报错
+
+    oid = (args.get("order_id") or "").strip().upper()
+    if oid and oid not in question.upper():
+        return (
+            f"用户没有提供订单号 {oid}。不要自己编造，也不要拿示例单号顶替 —— "
+            "请先向用户询问他的订单号，拿到之后再查。"
+        )
+    return T.dispatch(call["name"], call["arguments"])
+
+
 def _ask_with_tools(question, show_retrieval, emit, t0):
     """带工具调用的问答。
 
@@ -300,7 +409,7 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
         {"role": "system", "content": SYSTEM + SYSTEM_TOOLS},
         {
             "role": "user",
-            "content": f"【资料】\n{build_context(hits)}\n\n【问题】\n{question}",
+            "content": build_user_msg(build_context(hits), question),
         },
     ]
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
@@ -339,7 +448,7 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
             }
         )
         for i, c in enumerate(calls):
-            result = T.dispatch(c["name"], c["arguments"])
+            result = _dispatch_checked(T, c, question)
             trace.append({"name": c["name"], "args": c["arguments"], "result": result})
             if show_retrieval:
                 print(f"\n🔧 {c['name']}({c['arguments']})")
@@ -356,6 +465,15 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
         schema = None
 
     answer = "".join(pieces)
+
+    # 工具模式下会给工具数据挂引用编号 —— 实测固定标在 [3]，而 [3] 指向的是运费险规则，
+    # 与物流毫无关系。这类错误比不标更糟：看起来有出处，点开是别的东西。
+    # 规则 7c 已经禁止，但改了三轮措辞都按不住（模型在「有资料」的语境里会下意识标号），
+    # 还试过「调完工具就把资料撤掉」，结果更差：6 次里 1 次干脆不查单、反问用户要单号。
+    # 所以回到「资料照给、prompt 照写、代码兜底」，只在调过工具的轮次删编号。
+    if trace:
+        answer = re.sub(r"[ \t]*\[\d+\]", "", answer)
+
     t_total = time.perf_counter() - t0
     cost = inp / 1e6 * PRICE_IN + out / 1e6 * PRICE_OUT
 
@@ -398,7 +516,7 @@ def ask(question, show_retrieval=True, on_token=None):
     context = build_context(hits)
     messages = [
         {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": f"【资料】\n{context}\n\n【问题】\n{question}"},
+        {"role": "user", "content": build_user_msg(context, question)},
     ]
 
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
@@ -489,7 +607,12 @@ def report(info):
 #   · 文档表格写「1–2 天」，模型答「1–2天」      → 空格差异
 #   · 期望「可退可换可修」，模型答「（可退、可换、可修）」→ 顿号括号差异
 # 不删的：数字、连字符（3–7 不能变成 37）、以及任何字词。
-_KW_STRIP = str.maketrans("", "", " \t\n\r、，,。．；;：:（）()【】[]·\"'“”‘’")
+_KW_STRIP = str.maketrans(
+    "", "", " \t\n\r、，,。．；;：:（）()【】[]·\"'“”‘’*_`#>~"
+)
+# 为什么要删 Markdown 标记：换 flash 之后模型爱把关键词加粗，
+# 「**不能**与平台大促券一起使用」和期望的「不能与平台大促券一起使用」差两个星号就判失败。
+# 星号是排版，不是内容，属于该被归一化掉的东西 —— 和空格、顿号同一类。
 
 
 def _kw_hit(keyword, answer):
@@ -533,12 +656,34 @@ def judge(case, answer, hits=None):
     if kw and not _kw_hit(kw, answer):
         return False, f"❌ 缺关键词「{kw}」"
 
+    # 数字型答案按值比，不按字符比。原因见 numbers_in() 上方注释。
+    # 区间题（3–7 个工作日）把两端都列进来，两端都得出现。
+    vals = case.get("expected_values")
+    if vals:
+        got = numbers_in(answer)
+        miss = [v for v in vals if float(v) not in got]
+        if miss:
+            return False, f"❌ 数值不对：缺 {miss}（答案里抽到 {sorted(got)}）"
+
     # 有些题答案有多种正确表述（「可付费维修」/「不属于质量问题」都算对），
     # 单关键词会因措辞不同判成假失败。这些题改用 expected_keyword_any：命中任一即可。
     # 注意：列表里只放「核心判断」，不要放宽泛词，否则等于取消这条检查。
     anys = case.get("expected_keyword_any") or []
     if anys and not any(_kw_hit(w, answer) for w in anys):
         return False, f"❌ 没有命中任何应有表述：{anys}"
+
+    # 判断型题用正则表达「否定词 + 主题词」的关系，不再穷举措辞。
+    # 起因：「不能与平台大促券叠加使用」这条答案，同时躲过了
+    # 「不与X叠加」和「不能与X一起使用」两个关键词 —— 它恰好卡在两种说法的缝里。
+    # 换成 不[能与可]?.{0,8}(叠加|一起使用) 之后，不用再管模型这次用哪个否定词；
+    # 而「可以叠加」这种肯定式不会命中。
+    # 匹配前先过 _KW_STRIP：把 **不能** 的加粗星号去掉，否则星号会撑断正则。
+    regexes = case.get("expected_regex") or []
+    if regexes:
+        flat = answer.translate(_KW_STRIP)
+        hit = [p for p in regexes if re.search(p, flat)]
+        if not hit:
+            return False, f"❌ 没有命中关系规则：{regexes}"
 
     # 版本冲突题专用：答了旧版本/错值也算错（如现行 15 天，答 7 天内）
     wrong = [w for w in case.get("must_not_contain_value", []) if w in answer]

@@ -14,9 +14,21 @@
    每次调用都读，所以运行中切换立即生效，不用重启。
 """
 
+import os
 import re
 
 import streamlit as st
+
+# 托管平台（Streamlit Cloud / Hugging Face）的密钥放在平台自己的 Secrets 里，
+# 不会自动变成环境变量。必须在 import rag 之前注入 —— rag 是在模块级就读
+# API_KEY / BASE_URL / MODEL 的，晚一步读到的就是默认值（DeepSeek 的地址 + 空 key），
+# 表现是「界面能打开，一问就报 401」。
+# 用 setdefault：本地已经设了环境变量时，平台配置不覆盖本地，避免调试时被悄悄改掉。
+try:
+    for _k, _v in st.secrets.items():
+        os.environ.setdefault(str(_k), str(_v))
+except Exception:
+    pass  # 本地没有 secrets.toml，这是正常情况
 
 import rag
 import retrieval as R
@@ -24,11 +36,19 @@ import retrieval as R
 st.set_page_config(page_title="售后政策问答", layout="centered")
 
 # 三种检索方式。键是界面文字，值是 (HYBRID, RERANK)。
+#
+# 默认是「混合」，不是 BM25。原因不是偏好，是实测：
+# BM25 只认字面，「满多少钱包邮」这条的 top3 全是运费险段落和工单页，
+# 含「99 元包邮」的片段一个都没进来，模型只能答「资料中未提及」；
+# 「运费险最多能赔多少」更彻底，top3 里连 04-运费规则.md 都没有。
+# 换成混合后两题都答对，检索只多 12ms —— 这不是取舍，是白捡的。
+# 重排仍默认关：它只改排序（+850ms），该不该开由使用者按场景决定。
 MODES = {
-    "BM25（默认）": ("0", "0"),
+    "BM25（仅字面匹配）": ("0", "0"),
     "混合检索（BM25 + 向量）": ("1", "0"),
     "混合 + 重排": ("1", "1"),
 }
+DEFAULT_MODE = 1  # 界面首屏停在这一档
 
 MODE_LABEL = {
     "bm25": "BM25",
@@ -208,11 +228,18 @@ def ask_and_render(question):
 # ---------------- 侧边栏 ----------------
 with st.sidebar:
     st.subheader("检索设置")
+
+    # 索引必须先建好，再设检索方式：混合检索是在已有片段上算向量的。
+    # 顺序反了会报 "CHUNKS is not defined" 并降级成 BM25 —— 因为以前默认走 BM25、
+    # 从不触发向量，这个顺序问题一直藏着，把默认档改成混合才暴露出来。
+    n_chunks, n_docs = load_index()
+
     mode = st.radio(
         "检索方式",
         list(MODES),
-        index=0,
-        help="混合检索补召回，重排只改排序。两者默认关闭，原因见 README。",
+        index=DEFAULT_MODE,
+        help="混合检索补的是语义召回（+12ms）；重排只改排序（+850ms）。"
+        "重排换更准的 top1，但对「压根没召回到」的题没用。",
     )
     apply_mode(mode)
 
@@ -224,7 +251,6 @@ with st.sidebar:
     rag.TOOLS = "1" if use_tools else "0"
 
     st.divider()
-    n_chunks, n_docs = load_index()
     st.caption(f"知识库：{n_docs} 份文档 / {n_chunks} 个片段")
     st.caption(f"模型：{rag.MODEL}")
     st.caption(f"接口：{rag.BASE_URL}")
