@@ -42,6 +42,7 @@ $env:BASE_URL = "https://api.deepseek.com"
 .venv\Scripts\python.exe rag.py 七天无理由从哪天算      # 问一句
 .venv\Scripts\python.exe retrieval.py --golden        # 检索评测（不调用模型，零成本）
 .venv\Scripts\python.exe rag.py --golden              # 端到端评测（100 题约 ￥0.23）
+.venv\Scripts\python.exe -m streamlit run app.py      # 浏览器界面（流式 + 引用卡片）
 
 # 可选：开启混合检索（BM25 + 向量，RRF 融合）。默认关闭。
 # 需要额外的 embedding 端点，缺失时自动降级回纯 BM25，不会报错退出。
@@ -60,6 +61,23 @@ $env:RERANK = "1"
 
 ---
 
+## 界面
+
+`streamlit run app.py`，浏览器里问、流式出字、每句后面能展开看原文。
+
+| 界面上有什么 | 为什么这么设计 |
+| --- | --- |
+| 侧边栏切换 BM25 / 混合 / 混合+重排 | 开关直接改 `rag.HYBRID` / `rag.RERANK`，切换立即生效。跑实验用的参数，演示时也应该能当场对比 |
+| 答案下方「引用来源」可展开 | 每段带文档名、分数、原文前 260 字；答案里引了哪几段会标出来。客服场景「凭什么这么说」比「说得对不对」更难回答 |
+| 检索 / 首字 / 总耗时 / 花费四个数 | 让延迟和成本变成可见的，而不是藏在日志里。切换重排时那句 +0.8s 在这里能直接被看到 |
+| 会话内累计花费 | 防止演示时不知不觉花掉几块钱 |
+
+三种分数（BM25 无界、RRF 0.0x、重排 logit）在卡片上分别标注，不混成一个「相关度」。
+
+**设计上的一条界线**：界面里没有检索、没有拼 prompt、没有调模型，全部走 `rag.ask(question, on_token=...)`。流式逻辑只有一份，以后接工具调用（D12–D13 的查订单/查物流）只改 `rag` 那一层，界面不用动。
+
+---
+
 ## 项目结构
 
 | 文件                   | 作用                                                                                                           |
@@ -70,6 +88,7 @@ $env:RERANK = "1"
 | `hybrid.py`            | 混合检索：BM25 / 纯向量 / RRF 融合三模式对比，并提供 `rag.py` 用的向量与融合操作。结论见 [`docs/实验记录.md`](docs/实验记录.md) |
 | `rerank.py`            | 重排实验：混合 top10 → cross-encoder 重排 → top3，三种模式对比；也提供 `RERANK=1` 用的模型加载与打分 |
 | `rag.py`               | 检索 + 拼 context + 流式生成 + 引用编号。端到端入口                                                            |
+| `app.py`               | Streamlit 界面：流式回答、引用卡片、检索方式开关、耗时与花费。只调 `rag.ask()`，不含检索逻辑                    |
 | `main.py`              | 裸模型对照实验：不检索、不带资料。用来量化"RAG 到底补了什么"                                                   |
 | `diag_stream.py`       | 流式/首字时延诊断，见 [`docs/流式诊断.md`](docs/流式诊断.md)                                                   |
 | `run.bat` `diag.bat`   | 双击即跑，免去每次设环境变量                                                                                   |

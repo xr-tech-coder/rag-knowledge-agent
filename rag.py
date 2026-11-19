@@ -175,10 +175,16 @@ _MODE_LABEL = {
 }
 
 
-def ask(question, show_retrieval=True):
-    """一次完整的 RAG 问答。返回 (答案, 用量信息, 检索结果)。"""
+def ask(question, show_retrieval=True, on_token=None):
+    """一次完整的 RAG 问答。返回 (答案, 用量信息, 检索结果)。
+
+    on_token: 流式回调，收到就吐一个字符串片段。默认直接打到终端。
+    界面（app.py）传自己的回调，这样流式逻辑只有这一份 ——
+    复制一套到前端，两边迟早会对不上。
+    """
     from openai import OpenAI
 
+    emit = on_token or (lambda s: print(s, end="", flush=True))
     t0 = time.perf_counter()
 
     # ---------- 第 1 步：检索 ----------
@@ -240,7 +246,7 @@ def ask(question, show_retrieval=True):
             if first_at is None:
                 first_at = time.perf_counter() - t_gen
             pieces.append(c)
-            print(c, end="", flush=True)
+            emit(c)
 
     answer = "".join(pieces)
     t_total = time.perf_counter() - t0
@@ -251,6 +257,7 @@ def ask(question, show_retrieval=True):
     info = {
         "answer": answer,
         "hits": hits,
+        "mode": RETRIEVE_MODE,   # 实际生效的检索方式（降级后会变），界面按这个显示
         "t_retrieval": t_retrieval,
         "first_at": first_at if first_at is not None else t_total - t_gen,
         "t_total": t_total,
