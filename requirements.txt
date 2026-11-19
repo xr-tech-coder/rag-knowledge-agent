@@ -1,17 +1,16 @@
-# 装一个新包就往这里加一行，别一次性全装
+# 装一个新包就往这里加一行，别一次性全装。
+#
+# ⚠️ 这个文件同时是**托管平台的构建清单**（Streamlit Cloud / Hugging Face 只读它），
+# 所以只能放轻依赖。往这里加 torch 一类的东西，云端会直接构建失败或 OOM。
+# 重排依赖在 requirements-rerank.txt，本地想跑重排才装。
 openai>=1.30
 
-# 第 1 层：本地关键词检索（W1 用）
+# 第 1 层：本地关键词检索
 rank_bm25
 
 # 第 2 层：混合检索（BM25 + 向量，RRF 融合）
 # numpy 本来是 rank_bm25 的传递依赖，但 hybrid.py 直接 import 了它，显式写出来
 numpy
 
-# 第 3 层：界面（W1 用）
+# 第 3 层：界面
 streamlit
-
-# 第 4 层：重排实验（rerank.py / RERANK=1）。只有开重排才需要，
-# 会连带装 torch（CPU 版约 220MB）——不跑重排可以不装。
-# 模型权重约 471MB，放 .models/（已 gitignore）；没有会自动联网下载。
-sentence-transformers

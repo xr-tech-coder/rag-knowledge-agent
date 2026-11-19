@@ -1,0 +1,11 @@
+# 只有「本地要跑重排」时才装它。
+#
+#   pip install -r requirements-rerank.txt
+#
+# 会连带装 torch（CPU 版约 220MB）和 transformers。
+# 模型权重约 471MB，默认下到项目下的 .models/（已 gitignore），没有会自动联网下载。
+#
+# 为什么单独拆出来：
+#   1. 托管平台的免费实例只有 1GB 内存，装不下 torch，构建会失败；
+#   2. 线上默认 RERANK=0，根本不 import 它 —— 装进去纯属浪费镜像体积和构建时间。
+sentence-transformers

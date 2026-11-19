@@ -1,0 +1,22 @@
+# 这些都不该进镜像
+.venv/
+.models/
+.cache/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.env
+.env.*
+
+# 开发期产物，线上用不到
+backups/
+eval/
+docs/
+check_model.bat
+run.bat
+diag.bat
+
+# 特意没有 *.md 规则：data/ 下的 10 份知识库全是 .md，
+# 一条 *.md 写错（比如改成 **/*.md）就会让镜像里没有知识库，界面全答"资料未提供"。
+# 根目录目前只有 README.md，留着也就几 KB，不值得为它冒这个险。
