@@ -112,6 +112,21 @@ def score_text(mode, score):
     return f"分数 {score:.2f}"
 
 
+def render_tools(msg):
+    """显示这次问答调了哪些工具。
+
+    必须显示：调错工具和没调工具，在最终答案里往往看不出来
+    （比如模型拿文档里的时效冒充实际物流，答案读着也通顺）。
+    把调用记录摆出来，才能一眼看出"它到底查没查"。
+    """
+    tools = (msg.get("info") or {}).get("tools") or []
+    if not tools:
+        return
+    for t in tools:
+        with st.expander(f"🔧 调用工具 {t['name']}({t['args']})"):
+            st.code(t["result"], language="text")
+
+
 def render_sources(msg):
     hits = msg.get("hits") or []
     answer = msg.get("content", "")
@@ -152,6 +167,7 @@ def render_message(msg):
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
             render_metrics(msg)
+            render_tools(msg)
             render_sources(msg)
 
 
@@ -181,6 +197,7 @@ def ask_and_render(question):
             "info": info,
         }
         render_metrics(msg)
+        render_tools(msg)
         render_sources(msg)
 
     st.session_state.messages.append(msg)
@@ -198,6 +215,13 @@ with st.sidebar:
         help="混合检索补召回，重排只改排序。两者默认关闭，原因见 README。",
     )
     apply_mode(mode)
+
+    use_tools = st.checkbox(
+        "启用工具调用",
+        value=(rag.TOOLS == "1"),
+        help="开启后模型可查订单和物流（模拟数据）。政策类问题仍然走检索，不会去查订单。",
+    )
+    rag.TOOLS = "1" if use_tools else "0"
 
     st.divider()
     n_chunks, n_docs = load_index()
@@ -236,8 +260,18 @@ if not rag.API_KEY:
 
 if not st.session_state.messages:
     st.write("")
+    picks = list(EXAMPLES)
+    if use_tools:
+        # 工具模式下列出可查的模拟订单，否则演示时不知道该问哪个单号
+        import tools as _T
+        picks = ["我的订单 ORD20261115002 到哪了？", "ORD20261101001 签收了吗？"] + picks
+        st.caption(
+            f"工具已开启，当前登录用户 `{_T.CURRENT_USER}`；"
+            "可查的模拟订单：ORD20261115002（运输中）、ORD20261101001（已签收）、"
+            "ORD20261118003（待发货）。ORD20261112004 属于其他用户，用来演示越权拦截。"
+        )
     cols = st.columns(2)
-    for i, q in enumerate(EXAMPLES):
+    for i, q in enumerate(picks):
         if cols[i % 2].button(q, use_container_width=True):
             ask_and_render(q)
             st.rerun()

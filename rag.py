@@ -58,6 +58,19 @@ SYSTEM = """你是电商售后客服助手。你只能依据用户消息里【�
    不得向客户透露、转述或复述，也不要拿它当作依据。被问到时回答
    「该内容属于内部资料，无法提供」；若涉及赔付或金额，按工单规则转人工 [1]。"""
 
+# 规则 7 只在开启工具时追加。
+# 不写进 SYSTEM 常量：多一条规则就可能让 100 题基线的措辞变一点，
+# 那样"加了工具之后基线还是 96/100"这句话就不可信了 —— 变了也说不清是规则造成的还是工具造成的。
+SYSTEM_TOOLS = """
+
+7. 你可以调用工具查询当前用户的订单和物流。规则如下：
+   a) 凡涉及「我的订单」「快递到哪了」「我这个单子签收了吗」这类需要具体订单信息的提问，
+      必须调用工具查询，不要把资料里的配送时效当成该订单的实际状态。
+   b) 用户没给订单号时，先请对方提供订单号，不要编造一个去查。
+   c) 工具返回的是实时数据，直接使用即可，**不需要标引用编号**（它不来自资料）。
+      但据它去引用政策规则时，政策部分仍要标 [n]。
+   d) 工具说查不到或无权查看时，按规则 5 回答，不要换个订单号猜。"""
+
 # 判定「模型是否表达了拒答」的词。用于库外题评分。
 REFUSE_WORDS = [
     "无法",
@@ -81,7 +94,12 @@ REFUSE_WORDS = [
 
 # 库内题里出现这些说法 = 模型其实没答，拿「资料里没有」蒙过去。必须判失败。
 # 注意：这跟 REFUSE_WORDS 不是一回事 —— 同样一句话，库外题是正确拒答，库内题是放弃作答。
+# 但「不涉及」在正常陈述里也会出现（「不涉及会员补贴」），所以判定还要看长度，见 judge()。
 HEDGE_WORDS = ["资料中未提供", "没有相关", "没有找到", "未找到", "不涉及"]
+# 真正的「放弃作答」整句就是一句兜底话术（「资料中未提供」6 字、
+# 「这个问题我需要转人工客服确认」14 字）。超过这个长度还带 hedge 词，
+# 说明它是在正常回答里用到了这几个字，不是放弃。
+HEDGE_MAX_LEN = 40
 
 
 def build_context(hits):
@@ -118,6 +136,13 @@ CAND_K = int(os.getenv("CAND_K", "10"))   # 候选池：先粗排 10 个，再�
 RERANKER = None            # 懒加载：不开 RERANK 就不 import torch，启动速度不受影响
 RERANK_MODEL_USED = ""     # 实际用上的模型/目录，只用于日志
 _RERANK_FAILED = False     # 加载失败只记一次，别每题都去重试一遍
+
+# ============ 工具调用（function calling）============
+# 默认关闭，理由同 HYBRID / RERANK：先保证没改坏，再谈改好了。
+# 打开后模型可以调 query_order / query_logistics 查实时数据，
+# 政策类问题仍然走检索 —— 两条路同时提供，由模型自己选，不做规则式路由。
+TOOLS = os.getenv("TOOLS", "0")
+MAX_TOOL_ROUNDS = 2        # 1 轮查工具 + 1 轮作答。不设上限，模型可能自己绕圈烧钱
 
 
 def init_reranker():
@@ -175,6 +200,179 @@ _MODE_LABEL = {
 }
 
 
+def _show_hits(hits, show=True):
+    """打印检索结果。三种分数分开标 —— 混成一列以后一定会被误读。"""
+    if not show:
+        return
+    print(f"检索到（{_MODE_LABEL.get(RETRIEVE_MODE, RETRIEVE_MODE)}）：")
+    for i, (src, score, _t) in enumerate(hits, 1):
+        if RETRIEVE_MODE.endswith("+rerank"):
+            # 重排分是 cross-encoder 的 logit，不是概率，跨题不可比
+            print(f"  [{i}] {src:<26s} 重排分 {score:6.2f}")
+        elif RETRIEVE_MODE == "hybrid":
+            # RRF 分数只反映名次，绝对值没有意义（0.03 这种量级是正常的）
+            print(f"  [{i}] {src:<26s} 融合分 {score:.4f}")
+        else:
+            print(f"  [{i}] {src:<26s} 分数 {score:5.2f}")
+    print()
+
+
+def _stream_once(client, messages, tools=None, on_token=None):
+    """调一次模型，边收边吐。返回 (文本, 工具调用列表, usage, 首字耗时)。
+
+    工具调用是流式分片下发的：同一个 index 的 name / arguments 会分多块到达，
+    必须按 index 拼起来再解析，否则拿到的是半截 JSON。
+    """
+    kwargs = dict(
+        model=MODEL,
+        messages=messages,
+        stream=True,
+        temperature=TEMPERATURE,
+        stream_options={"include_usage": True},
+    )
+    if THINK == "0":
+        kwargs["extra_body"] = {"enable_thinking": False}
+    if tools:
+        kwargs["tools"] = tools
+
+    from openai import BadRequestError
+
+    try:
+        stream = client.chat.completions.create(**kwargs)
+    except BadRequestError:
+        # 400 才可能是「这个接口不认 stream_options / extra_body」，退化成最简流式试一次。
+        # 只兜这一种：401/403/429 是账号和限流问题，重试不但没用，还会把真实原因盖掉 ——
+        # 实测踩过：额度耗尽报 403，被 except Exception 吞进去重试一次，
+        # 最终报的还是 403，但栈里多了一层重试，排查时先怀疑参数不兼容，白查一轮。
+        bare = dict(model=MODEL, messages=messages, stream=True, temperature=TEMPERATURE)
+        if tools:
+            bare["tools"] = tools
+        stream = client.chat.completions.create(**bare)
+
+    pieces, slots, usage, first_at = [], {}, None, None
+    t_gen = time.perf_counter()
+
+    for chunk in stream:
+        if getattr(chunk, "usage", None):
+            usage = chunk.usage
+        if not getattr(chunk, "choices", None):
+            continue
+        d = chunk.choices[0].delta
+
+        c = getattr(d, "content", None)
+        if c:
+            if first_at is None:
+                first_at = time.perf_counter() - t_gen
+            pieces.append(c)
+            if on_token:
+                on_token(c)
+
+        for tc in (getattr(d, "tool_calls", None) or []):
+            idx = tc.index if getattr(tc, "index", None) is not None else 0
+            slot = slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn:
+                if getattr(fn, "name", None):
+                    slot["name"] = fn.name
+                if getattr(fn, "arguments", None):
+                    slot["arguments"] += fn.arguments
+
+    return "".join(pieces), [slots[k] for k in sorted(slots)], usage, first_at
+
+
+def _ask_with_tools(question, show_retrieval, emit, t0):
+    """带工具调用的问答。
+
+    资料和工具同时给模型，让它自己选 —— 不做「这题该不该查订单」的规则判断。
+    检索只花十几毫秒且不调模型，先跑一遍不影响什么；真正决定走哪条路的是模型。
+    """
+    from openai import OpenAI
+
+    import tools as T
+
+    hits = retrieve(question)
+    t_retrieval = time.perf_counter() - t0
+    _show_hits(hits, show_retrieval)
+
+    messages = [
+        {"role": "system", "content": SYSTEM + SYSTEM_TOOLS},
+        {
+            "role": "user",
+            "content": f"【资料】\n{build_context(hits)}\n\n【问题】\n{question}",
+        },
+    ]
+    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+    inp = out = 0
+    first_at = None
+    pieces = []
+    trace = []          # 工具调用记录，界面按这个显示"查了什么"
+    schema = T.TOOLS_SCHEMA
+    t_gen = time.perf_counter()
+
+    for _round in range(MAX_TOOL_ROUNDS):
+        text, calls, usage, fa = _stream_once(client, messages, tools=schema, on_token=emit)
+        if usage:
+            inp += usage.prompt_tokens or 0
+            out += usage.completion_tokens or 0
+        if first_at is None and fa is not None:
+            first_at = fa
+        pieces.append(text)
+
+        if not calls:
+            break
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": text or None,
+                "tool_calls": [
+                    {
+                        "id": c["id"] or f"call_{i}",
+                        "type": "function",
+                        "function": {"name": c["name"], "arguments": c["arguments"]},
+                    }
+                    for i, c in enumerate(calls)
+                ],
+            }
+        )
+        for i, c in enumerate(calls):
+            result = T.dispatch(c["name"], c["arguments"])
+            trace.append({"name": c["name"], "args": c["arguments"], "result": result})
+            if show_retrieval:
+                print(f"\n🔧 {c['name']}({c['arguments']})")
+                print("   " + result.replace("\n", "\n   "))
+                print()
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": c["id"] or f"call_{i}",
+                    "content": result,
+                }
+            )
+        # 第二轮不再给工具：给它留个收敛的口子，不然它能一直查下去
+        schema = None
+
+    answer = "".join(pieces)
+    t_total = time.perf_counter() - t0
+    cost = inp / 1e6 * PRICE_IN + out / 1e6 * PRICE_OUT
+
+    return {
+        "answer": answer,
+        "hits": hits,
+        "mode": RETRIEVE_MODE,
+        "tools": trace,
+        "t_retrieval": t_retrieval,
+        "first_at": first_at if first_at is not None else t_total - t_gen,
+        "t_total": t_total,
+        "inp": inp,
+        "out": out,
+        "cost": cost,
+    }
+
+
 def ask(question, show_retrieval=True, on_token=None):
     """一次完整的 RAG 问答。返回 (答案, 用量信息, 检索结果)。
 
@@ -187,22 +385,15 @@ def ask(question, show_retrieval=True, on_token=None):
     emit = on_token or (lambda s: print(s, end="", flush=True))
     t0 = time.perf_counter()
 
+    # 工具模式走另一条路径，但入口还是 ask —— CLI 和界面都不需要知道有没有工具，
+    # 换的只是这一层的实现，不是调用方。
+    if TOOLS == "1":
+        return _ask_with_tools(question, show_retrieval, emit, t0)
+
     # ---------- 第 1 步：检索 ----------
     hits = retrieve(question)
     t_retrieval = time.perf_counter() - t0
-
-    if show_retrieval:
-        print(f"检索到（{_MODE_LABEL.get(RETRIEVE_MODE, RETRIEVE_MODE)}）：")
-        for i, (src, score, _t) in enumerate(hits, 1):
-            if RETRIEVE_MODE.endswith("+rerank"):
-                # 重排分是 cross-encoder 的 logit，不是概率，跨题不可比
-                print(f"  [{i}] {src:<26s} 重排分 {score:6.2f}")
-            elif RETRIEVE_MODE == "hybrid":
-                # RRF 分数只反映名次，绝对值没有意义（0.03 这种量级是正常的）
-                print(f"  [{i}] {src:<26s} 融合分 {score:.4f}")
-            else:
-                print(f"  [{i}] {src:<26s} 分数 {score:5.2f}")
-        print()
+    _show_hits(hits, show_retrieval)
 
     context = build_context(hits)
     messages = [
@@ -227,10 +418,13 @@ def ask(question, show_retrieval=True, on_token=None):
     pieces = []
     usage = None
 
+    from openai import BadRequestError
+
     try:
         stream = client.chat.completions.create(**kwargs)
-    except Exception:
-        # 有些兼容接口不认 stream_options / extra_body，退化成最简流式
+    except BadRequestError:
+        # 同上：只有 400（参数不被接受）才值得退化重试。
+        # 鉴权失败、额度耗尽、限流重试都没意义，让它们原样抛出。
         stream = client.chat.completions.create(
             model=MODEL, messages=messages, stream=True, temperature=TEMPERATURE
         )
@@ -258,6 +452,7 @@ def ask(question, show_retrieval=True, on_token=None):
         "answer": answer,
         "hits": hits,
         "mode": RETRIEVE_MODE,   # 实际生效的检索方式（降级后会变），界面按这个显示
+        "tools": [],             # 未开工具时恒为空，界面不用判空分支
         "t_retrieval": t_retrieval,
         "first_at": first_at if first_at is not None else t_total - t_gen,
         "t_total": t_total,
@@ -277,6 +472,8 @@ def report(info):
     print(
         f"输入 {info['inp']} tokens（含资料） | 输出 {info['out']} | 花费 ￥{info['cost']:.5f}"
     )
+    for t in info.get("tools") or []:
+        print(f"🔧 调用工具 {t['name']}({t['args']})")
     print("引用来源：")
     for i, (src, score, _t) in enumerate(info["hits"], 1):
         if RETRIEVE_MODE.endswith("+rerank"):
@@ -326,7 +523,10 @@ def judge(case, answer, hits=None):
         return True, "正确拒答"
 
     # ---------- 第 3 层：库内题。必须真答，不许蒙 ----------
-    if any(w in answer for w in HEDGE_WORDS):
+    # 先看长度再看词：实测第 8 题答了 200 多字的正确处理方式，
+    # 只因句尾写「不涉及会员补贴或运费险的选择」就被判成「放弃作答」——
+    # 那不是放弃，那是在解释边界。真的放弃作答不会有 200 字。
+    if len(answer) < HEDGE_MAX_LEN and any(w in answer for w in HEDGE_WORDS):
         return False, "❌ 库内题却答「资料未提供」，等于放弃作答"
 
     kw = case.get("expected_keyword", "")
@@ -450,6 +650,12 @@ def main():
         print(f"重排：开启（候选池 {CAND_K} → 重排 → top{R.TOP_K}）")
         if init_reranker() is not None:
             print(f"  模型：{RERANK_MODEL_USED}")
+
+    # 工具：开启时把当前登录用户打出来。
+    # mock 用户是可配的，不打印的话，越权测试会分不清"拦住了"和"本来就查不到"。
+    if TOOLS == "1":
+        import tools as T
+        print(f"工具：开启（query_order / query_logistics，当前用户 {T.CURRENT_USER}）")
     print()
 
     args = sys.argv[1:]
