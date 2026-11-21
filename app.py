@@ -184,11 +184,54 @@ def render_metrics(msg):
 
 def render_message(msg):
     with st.chat_message(msg["role"]):
+        if msg.get("error"):
+            # 失败的消息只有错误说明，没有答题、引用、耗时可言
+            st.error(msg["content"])
+            return
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
             render_metrics(msg)
             render_tools(msg)
             render_sources(msg)
+
+
+def friendly_error(e):
+    """把接口异常翻译成人话。返回 Markdown，直接喂 st.error。
+
+    为什么值得单独写一个：默认行为是把 Python traceback 原样甩在聊天区，
+    读者看到的是 `openai.PermissionDeniedError: Error code: 403 - {...}`，
+    既不知道发生了什么，也不知道该找谁。而线上最常见的三种故障（额度、key、超时）
+    恰恰都能靠一句话说清。
+    """
+    raw = f"{type(e).__name__}: {e}"
+    low = raw.lower()
+
+    if "401" in raw or "invalid api key" in low or "authentication" in low or "unauthorized" in low:
+        return (
+            "**接口鉴权失败（401）**\n\n"
+            "API_KEY 没被读到，或者已经失效。\n\n"
+            "本地：检查 `.streamlit/secrets.toml` 或环境变量。\n"
+            "线上：检查平台 Secrets 里的 `API_KEY` 有没有多余空格、引号是不是英文。"
+        )
+    if "403" in raw or "quota" in low or "insufficient" in low or "balance" in low or "arrears" in low:
+        return (
+            "**额度用完了（403）**\n\n"
+            "这不是代码问题——模型服务那边没有可用额度了。\n\n"
+            "去控制台充值，或关掉「仅使用免费额度」模式。"
+        )
+    if "rate limit" in low or "429" in raw:
+        return "**触发限流（429）**\n\n问得太快了，等几秒再试。"
+    if "timeout" in low or "timed out" in low:
+        return (
+            "**请求超时**\n\n"
+            "模型服务响应太慢。重试一次通常就好了；连续超时说明网络或服务端有问题。"
+        )
+    if "connection" in low or "network" in low or "resolve" in low or "ssl" in low:
+        return (
+            "**连不上模型服务**\n\n"
+            "检查网络，以及 `BASE_URL` 是否写错（末尾 `/v1` 容易漏或写重）。"
+        )
+    return f"**出错了**：`{type(e).__name__}`\n\n```\n{str(e)[:300]}\n```"
 
 
 def ask_and_render(question):
@@ -206,7 +249,21 @@ def ask_and_render(question):
             buf.append(t)
             box.markdown("".join(buf) + "▌")
 
-        info = rag.ask(question, show_retrieval=False, on_token=on_token)
+        try:
+            info = rag.ask(question, show_retrieval=False, on_token=on_token)
+        except Exception as e:
+            # 不接这个异常，界面就是一段 traceback。
+            # 而且外层紧接着会 st.rerun()，这一轮的即时渲染会被整片冲掉，
+            # 错误一闪而过 —— 用户只看到自己的问题挂着、没有回答。
+            # 所以错误必须当成一条 assistant 消息存进 session_state 才能活下来。
+            box.empty()
+            text = friendly_error(e)
+            st.error(text)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": text, "error": True}
+            )
+            return
+
         box.markdown(info["answer"])
 
         msg = {
@@ -232,7 +289,17 @@ with st.sidebar:
     # 索引必须先建好，再设检索方式：混合检索是在已有片段上算向量的。
     # 顺序反了会报 "CHUNKS is not defined" 并降级成 BM25 —— 因为以前默认走 BM25、
     # 从不触发向量，这个顺序问题一直藏着，把默认档改成混合才暴露出来。
-    n_chunks, n_docs = load_index()
+    try:
+        n_chunks, n_docs = load_index()
+    except Exception as e:
+        # 这是"整页白屏"的典型来源：data/ 没进镜像、文件编码不对、路径写错。
+        # 不拦住的话，Streamlit 会在页面顶部甩一段 traceback，副标题都没有。
+        st.error(f"知识库加载失败：{type(e).__name__}: {e}")
+        st.caption(
+            "检查 `data/` 下是否有 10 份 .md；线上还要确认它们被打包进了镜像"
+            "（`.dockerignore` 里别写 `*.md`）。"
+        )
+        st.stop()
 
     mode = st.radio(
         "检索方式",
