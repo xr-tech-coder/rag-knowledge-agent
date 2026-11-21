@@ -89,6 +89,11 @@ $env:BASE_URL = "https://api.deepseek.com"
 .venv\Scripts\python.exe check_model.py               # 换模型自检（四项，约 ￥0.01）
 .venv\Scripts\python.exe -m streamlit run app.py      # 浏览器界面（流式 + 引用卡片）
 
+# 可选：HTTP 接口（FastAPI）。界面之外的第二条交付路径，共用同一个 rag.ask
+.venv\Scripts\python.exe -m pip install -r requirements-api.txt
+.venv\Scripts\python.exe -m uvicorn api:app --port 8000
+# GET /healthz · POST /chat · POST /chat/stream（SSE）· GET /eval/retrieval
+
 # 可选：开启混合检索（BM25 + 向量，RRF 融合）。默认关闭。
 # 需要额外的 embedding 端点，缺失时自动降级回纯 BM25，不会报错退出。
 $env:HYBRID        = "1"
@@ -131,6 +136,36 @@ $env:MOCK_USER = "u_1001"     # 模拟的当前登录用户，用于演示越权
 改默认档位时还牵出一个藏了很久的顺序 bug：侧边栏里「设检索方式」排在「建索引」前面，混合档首屏必报 `CHUNKS is not defined` 再降级回 BM25。以前默认就是 BM25、从不触发向量，所以这个 bug 一直没显形。
 
 **设计上的一条界线**：界面里没有检索、没有拼 prompt、没有调模型，全部走 `rag.ask(question, on_token=...)`。流式逻辑只有一份。这条界线后来被验证过一次——接工具调用时只改了 `rag.py`，`app.py` 只加了一个开关和一个展示块，问答流程一行没动。
+
+---
+
+## HTTP 接口（FastAPI）
+
+界面之外的第二条交付路径。同一个 `rag.ask`，不复制任何检索或生成逻辑。
+
+```bash
+pip install -r requirements-api.txt
+.venv\Scripts\python.exe -m uvicorn api:app --port 8000
+```
+
+| 端点 | 作用 | 备注 |
+| --- | --- | --- |
+| `GET /healthz` | 探活 + 报告配置指纹 | 模型 / 混合 / 重排 / 片段数，与缓存 key 同一套维度 |
+| `POST /chat` | 一次性返回答案 + 指标 + 工具轨迹 | 适合脚本、评测 |
+| `POST /chat/stream` | SSE：`start` → `token`\\* / `event`\\* → `done` | 适合前端逐字渲染 |
+| `GET /eval/retrieval` | 跑检索层门禁，返回四项检查 | 纯本地 BM25，约 2 秒，零成本 |
+
+**流式必须用线程 + 队列。** `rag.ask` 是阻塞的、`on_token` 是同步回调，在生成器里直接 `yield` 拿不到它。所以起线程跑 `ask`、回调往队列塞、生成器从队列吐。少了这层只能等全文生成完一次性返回——那就不叫流式。实测：桩模型每 150ms 吐一个词，客户端收到的相邻 token 间隔就是 150/150/150…，不是最后一起到。
+
+**降级路径也要推正文。** 预设话术是整段返回的、不经过流式回调，不补这一段流式客户端会全程空着，直到 `done` 突然刷出全文，看起来像卡死。所以「一个 token 都没收到但答案非空」时补推一段——它本来就是一次给的，不算假装流式。
+
+**故障分两种，状态码也要分开。** 额度/网络这类上游故障，`rag.ask` 内部降级链已经接住，返回 **200 + `mode: "degraded"`**（答案里明说是标准答复，调用方靠 `mode` 判断，不用解析文案）；只有代码级异常才冒到接口层，返回 **503 + 人话**。用 500 会让人以为是我们的 bug，跑去查代码。
+
+**工具结果只给第一行摘要。** 完整返回里有签收人和手机号，给摘要够判断「它到底查没查」，给全文就是把个人信息散给调用方。
+
+**不接受按请求改检索档位。** 档位是模块级全局变量，十个请求各带一个会互相干扰、出事还无法归因。要换就改环境变量重启。
+
+**阈值只有一份**（`quality.py`）。CI 和 `/eval/retrieval` 读同一处——各判一次就会出现「CI 说达标、接口说不达标」，到时候没人知道该信谁。阈值被复制的那天，它就不再是基线了。
 
 ---
 
@@ -272,7 +307,7 @@ TOOLS=1（混合 + 重排）   100 题 ￥0.3725   (评测口径，含重排)
 
 | 层 | 触发 | 内容 | 成本 |
 | --- | --- | --- | --- |
-| 离线 | 每次 push / PR | 13 个文件语法、模块导入、降级链 12 断言、检索层 74/78 + top1 71/78 | **0** |
+| 离线 | 每次 push / PR | 17 个文件语法、模块导入、降级链 12 断言、检索层 74/78 + top1 71/78、接口 31 断言 | **0** |
 | 生成层 | 手动 `workflow_dispatch` | 10 题冒烟：答案 / 检索 / 首字 / 总耗时 / token / 花费 | ￥0.05／次 |
 
 **为什么生成层不进 push 门禁。** 100 题一次 ￥0.37、3 分钟起，一天二十次 push 就是几块钱；更麻烦的是 fork 和 PR 拿不到 secret，会把 CI 长期跑红——**长期红的门禁等于没有门禁**。宁可它窄，也要它一直绿。
@@ -298,7 +333,12 @@ python eval/eval_retrieval.py --min-pass 80   # 退出码 1，CI 变红
 | `eval/smoke10.py` | 10 题冒烟（4 示例 + 3 政策 + 3 订单），出 CSV：答案 / 检索 / 首字 / 总耗时 / token / 花费。改完代码跑一遍，确认链路没坏 |
 | `eval/test_degrade.py` | 降级链 12 项断言，全用桩实现，不调模型、零成本。额度断了也能跑 |
 | `eval/eval_retrieval.py` | **检索层门禁**：跑纯 BM25 的 100 题检索层，低于基线就以退出码 1 结束。CI 用它，不花钱 |
-| `.github/workflows/ci.yml` | 两层门禁：每次 push 跑离线四项（语法 / 导入 / 降级 / 检索）；生成层只手动触发，因为要花额度 |
+| `eval/test_api.py` | 接口层 31 项断言，全用桩：SSE 帧格式、故障转 503、工具摘要不含个人信息、降级不空屏 |
+| `api.py` | FastAPI 服务层：`/healthz`、`/chat`、`/chat/stream`、`/eval/retrieval`。只调 `rag.ask`，不含检索逻辑 |
+| `quality.py` | 门禁阈值与判定的**唯一来源**。CI 与 `/eval/retrieval` 都读它，避免两处各判一次 |
+| `errors.py` | `friendly_error()`：异常 → 人话（401/403/429/超时/连不上）。界面与接口共用一份文案 |
+| `requirements-api.txt` | 服务层依赖（fastapi / uvicorn / httpx）。不并进 `requirements.txt`——托管平台只读后者，界面不需要 FastAPI |
+| `.github/workflows/ci.yml` | 两层门禁：每次 push 跑离线五项（语法 / 导入 / 降级 / 检索 / 接口）；生成层只手动触发，因为要花额度 |
 | `retrieval.py`         | 切段 + BM25 检索 + 检索层评测。**不依赖模型，随时可跑**，是所有改动的回归基线                                  |
 | `hybrid.py`            | 混合检索：BM25 / 纯向量 / RRF 融合三模式对比，并提供 `rag.py` 用的向量与融合操作。结论见 [`docs/实验记录.md`](docs/实验记录.md) |
 | `rerank.py`            | 重排实验：混合 top10 → cross-encoder 重排 → top3，三种模式对比；也提供 `RERANK=1` 用的模型加载与打分 |

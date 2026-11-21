@@ -32,7 +32,7 @@ jobs:
       - name: 装依赖（只装轻依赖，不含 torch）
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-api.txt
 
       - name: 语法检查
         run: |
@@ -50,6 +50,11 @@ jobs:
         # 纯 BM25，不调 embedding：库内 74/78、top1 71/78、平均取回 965 字
         # 低于基线即红 —— 切分和 tokenize 最容易在界面上看不出来地改坏召回
         run: python eval/eval_retrieval.py
+
+      - name: HTTP 接口断言
+        # 31 项，全用桩：SSE 帧格式、故障转 503、工具摘要不含个人信息、降级不空屏
+        # 不调模型 —— 接口层的错（字段改名、状态码写错）本来就不该靠跑模型才发现
+        run: python eval/test_api.py
 
   model-eval:
     name: 生成层冒烟（手动触发，消耗额度）

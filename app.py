@@ -19,6 +19,9 @@ import re
 
 import streamlit as st
 
+# 错误翻译与 HTTP 服务层共用一份：两边各写一份，文案会慢慢对不上。
+from errors import friendly_error
+
 # 托管平台（Streamlit Cloud / Hugging Face）的密钥放在平台自己的 Secrets 里，
 # 不会自动变成环境变量。必须在 import rag 之前注入 —— rag 是在模块级就读
 # API_KEY / BASE_URL / MODEL 的，晚一步读到的就是默认值（DeepSeek 的地址 + 空 key），
@@ -238,45 +241,6 @@ def render_message(msg):
             render_metrics(msg)
             render_tools(msg)
             render_sources(msg)
-
-
-def friendly_error(e):
-    """把接口异常翻译成人话。返回 Markdown，直接喂 st.error。
-
-    为什么值得单独写一个：默认行为是把 Python traceback 原样甩在聊天区，
-    读者看到的是 `openai.PermissionDeniedError: Error code: 403 - {...}`，
-    既不知道发生了什么，也不知道该找谁。而线上最常见的三种故障（额度、key、超时）
-    恰恰都能靠一句话说清。
-    """
-    raw = f"{type(e).__name__}: {e}"
-    low = raw.lower()
-
-    if "401" in raw or "invalid api key" in low or "authentication" in low or "unauthorized" in low:
-        return (
-            "**接口鉴权失败（401）**\n\n"
-            "API_KEY 没被读到，或者已经失效。\n\n"
-            "本地：检查 `.streamlit/secrets.toml` 或环境变量。\n"
-            "线上：检查平台 Secrets 里的 `API_KEY` 有没有多余空格、引号是不是英文。"
-        )
-    if "403" in raw or "quota" in low or "insufficient" in low or "balance" in low or "arrears" in low:
-        return (
-            "**额度用完了（403）**\n\n"
-            "这不是代码问题——模型服务那边没有可用额度了。\n\n"
-            "去控制台充值，或关掉「仅使用免费额度」模式。"
-        )
-    if "rate limit" in low or "429" in raw:
-        return "**触发限流（429）**\n\n问得太快了，等几秒再试。"
-    if "timeout" in low or "timed out" in low:
-        return (
-            "**请求超时**\n\n"
-            "模型服务响应太慢。重试一次通常就好了；连续超时说明网络或服务端有问题。"
-        )
-    if "connection" in low or "network" in low or "resolve" in low or "ssl" in low:
-        return (
-            "**连不上模型服务**\n\n"
-            "检查网络，以及 `BASE_URL` 是否写错（末尾 `/v1` 容易漏或写重）。"
-        )
-    return f"**出错了**：`{type(e).__name__}`\n\n```\n{str(e)[:300]}\n```"
 
 
 def ask_and_render(question):

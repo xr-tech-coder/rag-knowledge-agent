@@ -1,0 +1,15 @@
+# HTTP 服务层（api.py）的依赖。单独一份，不并进 requirements.txt。
+#
+# 为什么不并进去：
+#   requirements.txt 同时是托管平台的构建清单（Streamlit Cloud 只读它），
+#   那边跑的是界面，不需要 FastAPI。混进去只是让云端多装几个包、慢一点。
+#   界面和 API 是两条部署路径，依赖也应该分开 —— 和 requirements-rerank.txt 同理。
+#
+#   pip install -r requirements-api.txt
+#
+# httpx 不是服务端依赖，是测试依赖：fastapi.testclient 用它发请求。
+# 放在这里而不是另开一个 test 文件，是因为这份清单本身就只在「跑服务/跑测试」时用。
+
+fastapi
+uvicorn
+httpx
