@@ -28,6 +28,9 @@ import time
 os.environ["TOOLS"] = "1"  # 必须在 import rag 之前：rag 在模块级读这个变量
 
 import rag  # noqa: E402
+
+# 评测不吃缓存。否则同一套题跑第二遍全命中，测出来的是上次的自己。
+rag.NO_CACHE = True
 import retrieval as R  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))

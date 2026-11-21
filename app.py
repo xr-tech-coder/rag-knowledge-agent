@@ -200,6 +200,17 @@ def render_metrics(msg):
     info = msg.get("info") or {}
     if not info:
         return
+
+    d = info.get("degraded")
+    if d == "cache":
+        # 缓存命中时四个指标全是 0，摆一排 0 让人以为出了问题
+        st.caption("⚡ **缓存命中**（同一问题 + 相同配置）· 本次未调用模型 · 花费 0")
+        return
+    if d in ("canned", "handoff"):
+        level = "预设标准答复" if d == "canned" else "转人工"
+        st.caption(f"⚠️ **已降级为{level}** · 故障：`{info.get('fault', '')[:90]}`")
+        return
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("检索", f"{info.get('t_retrieval', 0) * 1000:.0f} ms")
     c2.metric("首字", f"{info.get('first_at', 0):.2f} s")
@@ -375,6 +386,13 @@ with st.sidebar:
         st.session_state.total_cost = 0.0
         st.session_state.total_q = 0
         st.rerun()
+
+    # 缓存跟着配置指纹失效，改档位不用手动清。留这个按钮是给"我就想看一次
+    # 真实答案"的场景 —— 比如演示前确认模型没坏，不想被上次的缓存糊弄。
+    if st.button("清空答案缓存", use_container_width=True):
+        n = len(rag._CACHE)
+        rag._CACHE.clear()
+        st.caption(f"已清空 {n} 条缓存")
 
 # ---------------- 主区 ----------------
 st.session_state.setdefault("messages", [])

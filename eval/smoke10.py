@@ -77,6 +77,8 @@ def main():
     # 三个开关都是字符串 "0"/"1"，跟 app.py 侧边栏改的是同一批变量
     rag.TOOLS = "1"
     rag.HYBRID = "1"
+    # 冒烟测的是真实耗时，不能吃缓存，否则第二轮全是 0ms
+    rag.NO_CACHE = True
     print(f"MODEL={rag.MODEL}  TOOLS={rag.TOOLS}  HYBRID={rag.HYBRID}")
     print("首次检索要算向量（约 2s），第 1 题的数字不代表稳态。\n")
 

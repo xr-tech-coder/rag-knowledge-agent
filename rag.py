@@ -17,6 +17,7 @@ D3：完整 RAG —— 检索到 3 段资料，让模型只依据这些资料回
 关键设计：检索层完全复用 retrieval.py，不重复写。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -559,24 +560,13 @@ def _ask_with_tools(question, show_retrieval, emit, t0, on_event=None):
     }
 
 
-def ask(question, show_retrieval=True, on_token=None, on_event=None):
-    """一次完整的 RAG 问答，返回 dict。事件说明见 _ask_with_tools。
+def _ask_basic(question, show_retrieval, emit, t0):
+    """不开工具的那条路：检索 → 拼资料 → 流式生成。
 
-    on_token: 流式回调，收到就吐一个字符串片段。默认直接打到终端。
-    界面（app.py）传自己的回调，这样流式逻辑只有这一份 ——
-    复制一套到前端，两边迟早会对不上。
-
-    on_event: 过程事件。不开工具时不会有任何事件，传了也不会被调用。
+    从原 ask() 抽出来的，行为没有任何改动。调度（缓存 / 降级）现在在 ask() 那一层，
+    这一层只负责「怎么把答案问出来」。
     """
     from openai import OpenAI
-
-    emit = on_token or (lambda s: print(s, end="", flush=True))
-    t0 = time.perf_counter()
-
-    # 工具模式走另一条路径，但入口还是 ask —— CLI 和界面都不需要知道有没有工具，
-    # 换的只是这一层的实现，不是调用方。
-    if TOOLS == "1":
-        return _ask_with_tools(question, show_retrieval, emit, t0, on_event)
 
     # ---------- 第 1 步：检索 ----------
     hits = retrieve(question)
@@ -655,6 +645,187 @@ def ask(question, show_retrieval=True, on_token=None, on_event=None):
         "out": out,
         "cost": cost,
     }
+    return info
+
+
+# ============ 降级链：缓存 → 预设话术 → 转人工 ============
+# 原计划四级：缓存 → 小模型 → 预设话术 → 转人工。小模型那级要另一个模型额度，
+# 先不做；剩下三级都不花钱，而且覆盖了绝大多数故障场景。
+#
+# 一条不能破的规矩：降级返回的答案必须自己说清「这不是模型答的」。
+# 悄悄拿预设话术顶上去，读者分不出这是兜底还是真答 —— 比白屏更危险，
+# 因为白屏至少不会让人相信错的东西。
+
+_CACHE = {}
+_CACHE_MAX = 200
+
+# 评测必须关掉缓存。不关的话，同一套题跑第二遍全命中，耗时接近 0、分数漂亮 ——
+# 那测的不是模型，是上次的自己。所以给一个显式开关，而不是靠"记得清缓存"。
+NO_CACHE = os.getenv("NO_CACHE", "0") == "1"
+
+
+def _fingerprint():
+    """配置指纹。任一项变了，旧缓存全部作废。
+
+    只按问题文本做 key 是最容易犯的错：改了检索档位或模型，同一个问题
+    还返回旧配置下的答案，读者看到一份和当前设置对不上的结果 ——
+    这比不缓存更糟，因为它看起来是对的，没人会去怀疑。
+    """
+    n = len(CHUNKS) if CHUNKS else 0
+    return f"{MODEL}|{HYBRID}|{RERANK}|{TOOLS}|{n}"
+
+
+def _cache_key(question):
+    raw = f"{_fingerprint()}|{question.strip()}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_get(question):
+    info = _CACHE.get(_cache_key(question))
+    if info is None:
+        return None
+    hit = dict(info)
+    # 耗时和花费清零：这次真的没花。不清零就是拿上次的数字冒充这次，指标就废了。
+    hit["degraded"] = "cache"
+    hit["t_retrieval"] = 0.0
+    hit["first_at"] = 0.0
+    hit["t_total"] = 0.0
+    hit["cost"] = 0.0
+    hit["inp"] = 0
+    hit["out"] = 0
+    return hit
+
+
+def _cache_put(question, info):
+    if len(_CACHE) >= _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))   # dict 有序，删最早那条
+    _CACHE[_cache_key(question)] = info
+
+
+# 预设话术：只覆盖关键词组合非常明确的几道高频题，内容是知识库原文的摘录。
+# 故意不做模糊匹配 —— 这一层要的是「绝不说错话」，不是「答得全」，
+# 匹配不上就交给转人工，宁可少答。
+CANNED = [
+    (
+        ("包邮",),
+        ("多少", "满", "几", "条件", "免运"),
+        "单笔实付满 99 元包邮（偏远地区除外）。"
+        "未满 99 元：首重 1kg 收 12 元，续重每 kg 加 8 元，不足 1kg 按 1kg 计。",
+        "04-运费规则",
+    ),
+    (
+        ("七天无理由",),
+        ("哪", "算", "起", "时间", "开始"),
+        "自签收次日 0 点起 7 个自然日内，商品未使用、不影响二次销售，可申请无理由退货。"
+        "起点是「签收次日 0 点」，不是下单时间，也不是发货时间。",
+        "01-售后政策",
+    ),
+    (
+        ("运费险",),
+        ("多少", "赔", "上限", "几"),
+        "运费险赔付上限 15 元，单笔订单只赔付一次。"
+        "新疆、西藏、内蒙古部分区域、海南离岛不适用运费险。",
+        "04-运费规则",
+    ),
+]
+
+HANDOFF_TEXT = (
+    "这个问题没能匹配到标准答复。请稍后重试，或联系在线客服转接人工处理。"
+)
+
+
+def _canned_answer(question):
+    q = question.strip()
+    for need_all, need_any, text, src in CANNED:
+        if all(w in q for w in need_all) and any(w in q for w in need_any):
+            return text, src
+    return None
+
+
+# 只对「服务侧故障」降级。代码 bug（NameError / TypeError 之类）必须继续抛 ——
+# 把它变成一句「请联系人工」，等于把 bug 埋进日志里，以后没人会去修。
+_SERVICE_FAULT_HINTS = (
+    "401", "403", "429", "quota", "rate limit", "timeout", "timed out",
+    "connection", "network", "ssl", "unauthorized", "authentication",
+    "insufficient", "balance", "arrears", "permissiondenied", "apiconnection",
+    "internalserver", "serviceunavailable",
+)
+
+
+def _is_service_fault(e):
+    raw = f"{type(e).__name__}: {e}".lower()
+    return any(h in raw for h in _SERVICE_FAULT_HINTS)
+
+
+def _degraded(question, e, t0):
+    """模型侧不可用时的兜底。返回的答案自带显式标注。"""
+    canned = _canned_answer(question)
+    if canned:
+        text, src = canned
+        answer = (
+            "⚠️ **自动答复暂时不可用**（模型服务异常），以下是**标准答复**，"
+            "不是实时生成：\n\n"
+            f"{text}\n\n"
+            f"_来源：{src}。服务恢复后重新提问可获得完整回答。_"
+        )
+        level = "canned"
+    else:
+        answer = f"⚠️ **自动答复暂时不可用**（模型服务异常）。{HANDOFF_TEXT}"
+        level = "handoff"
+
+    return {
+        "answer": answer,
+        "hits": [],
+        "mode": "degraded",
+        "tools": [],
+        "t_retrieval": 0.0,
+        "first_at": 0.0,
+        "t_total": time.perf_counter() - t0,
+        "inp": 0,
+        "out": 0,
+        "cost": 0.0,
+        "degraded": level,
+        "fault": f"{type(e).__name__}: {str(e)[:200]}",
+    }
+
+
+def ask(question, show_retrieval=True, on_token=None, on_event=None):
+    """一次完整的 RAG 问答，返回 dict。
+
+    这一层只管调度：缓存 → 真调用 → 降级。真正的问答在 _ask_basic / _ask_with_tools，
+    界面和 CLI 都调这个入口，不需要知道底下有没有工具、有没有降级。
+
+    on_token: 流式回调，收到就吐一个字符串片段。默认直接打到终端。
+    on_event: 过程事件，不开工具时不会被调用。
+    """
+    emit = on_token or (lambda s: print(s, end="", flush=True))
+    t0 = time.perf_counter()
+
+    # ---------- 第 0 步：缓存 ----------
+    hit = None if NO_CACHE else _cache_get(question)
+    if hit is not None:
+        if on_event:
+            on_event({"type": "cache"})
+        # 缓存也要走一遍流式回调：界面的正文是靠 on_token 累积出来的，
+        # 直接 return 会让界面停在"检索中…"，答案根本没渲染出来
+        emit(hit["answer"])
+        return hit
+
+    # ---------- 第 1 步：真调用 ----------
+    try:
+        if TOOLS == "1":
+            info = _ask_with_tools(question, show_retrieval, emit, t0, on_event)
+        else:
+            info = _ask_basic(question, show_retrieval, emit, t0)
+    except Exception as e:  # noqa: BLE001
+        if not _is_service_fault(e):
+            raise          # 代码 bug 照原样抛，不许被降级掩盖
+        info = _degraded(question, e, t0)
+    else:
+        # 只缓存成功的结果。把降级结果也缓存起来，等于额度恢复了还在返"转人工"。
+        if not NO_CACHE:
+            _cache_put(question, info)
+
     return info
 
 

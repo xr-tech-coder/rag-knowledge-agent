@@ -26,6 +26,9 @@ backups/
 # 向量缓存：二进制产物，谁跑谁生成，不进仓库
 eval/.vec_cache.npz
 
+# 冒烟结果：每次重跑都会变，留着会一直显示为未提交改动
+eval/smoke10_result.csv
+
 # 本地模型权重与依赖缓存：1GB 级，绝不进仓库
 .models/
 .cache/
