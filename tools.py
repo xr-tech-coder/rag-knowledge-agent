@@ -150,19 +150,38 @@ TOOLS_SCHEMA = [
 _FUNCS = {"query_order": query_order, "query_logistics": query_logistics}
 
 
-def dispatch(name, arguments):
-    """执行一个工具调用。任何异常都变成文本返回给模型，不让问答挂掉。"""
+def dispatch_ex(name, arguments):
+    """执行一个工具调用，返回 (status, 文本)。
+
+    status 取值：ok / denied / blocked / error。
+    为什么状态要单独返回，而不是让界面去文本里找关键字：
+    那样换个措辞就判错（"不存在或无权查看"到底算哪个？），
+    而且和"关键词判定"犯的是同一个错 —— 让代码猜语义。
+    工具层明明知道答案，就该直接说出来。
+
+    "blocked" 由 rag 层的参数校验产生，这里不会返回，但 UI 共用一套渲染。
+    """
     fn = _FUNCS.get(name)
     if fn is None:
-        return f"未知工具：{name}"
+        return "error", f"未知工具：{name}"
     try:
         args = json.loads(arguments or "{}")
     except json.JSONDecodeError:
-        return f"参数不是合法 JSON，无法执行 {name}。"
+        return "error", f"参数不是合法 JSON，无法执行 {name}。"
     order_id = args.get("order_id", "")
     if not order_id:
-        return "缺少 order_id 参数，请先向用户询问订单号。"
-    return fn(order_id)
+        return "error", "缺少 order_id 参数，请先向用户询问订单号。"
+    try:
+        if _find(order_id)[1]:
+            return "denied", fn(order_id)
+    except Exception as e:  # noqa: BLE001  数据文件坏了也要给模型一句话，不能抛
+        return "error", f"工具执行出错（{type(e).__name__}），无法查询该订单。"
+    return "ok", fn(order_id)
+
+
+def dispatch(name, arguments):
+    """执行一个工具调用。任何异常都变成文本返回给模型，不让问答挂掉。"""
+    return dispatch_ex(name, arguments)[1]
 
 
 if __name__ == "__main__":

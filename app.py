@@ -84,11 +84,12 @@ st.markdown(
 # ---------------- 后端资源：整个进程只加载一次 ----------------
 @st.cache_resource(show_spinner=False)
 def load_index():
-    """建一次索引。Streamlit 会反复重跑脚本，这里必须缓存。"""
-    chunks = R.load_chunks()
-    bm25 = R.build_index(chunks)
-    rag.CHUNKS, rag.BM25 = chunks, bm25
-    return len(chunks), len({s for s, _ in chunks})
+    """建一次索引。Streamlit 会反复重跑脚本，这里必须缓存。
+
+    真正建索引的逻辑在 rag.ensure_index()，这里只负责缓存 ——
+    否则同一件事要在界面、命令行、脚本各写一遍，迟早有一处漏掉。
+    """
+    return rag.ensure_index()
 
 
 @st.cache_resource(show_spinner=False)
@@ -132,6 +133,33 @@ def score_text(mode, score):
     return f"分数 {score:.2f}"
 
 
+_STATUS_MARK = {"ok": "✓", "denied": "✗", "blocked": "⛔", "error": "⚠"}
+
+
+def _event_lines(items):
+    """把过程事件渲染成几行小字，显示在答案上方。
+
+    items 可以是 rag 推来的事件（含 type），也可以是历史消息里的 info["tools"]，
+    两者字段一致（name/status/order_id/preview），所以一个函数够用。
+    没有工具事件时显示「正在判断」—— 那一步是整条链路里最长的空白（等模型决定
+    要不要查单），不占位的话用户看到的是提问后静默一两秒。
+    """
+    # 事件里有 thinking 和 tool 两种；历史消息的 info["tools"] 没有 type 字段。
+    # 用「有 name 且 type 不是 thinking」来挑，两种来源都能过。
+    tools = [e for e in items if e.get("name") and e.get("type") != "thinking"]
+    if not tools:
+        return "⏳ 正在判断是否需要查询订单…"
+    lines = []
+    for e in tools:
+        mark = _STATUS_MARK.get(e.get("status"), "•")
+        preview = e.get("preview") or ""
+        if not preview and e.get("result"):
+            preview = (e.get("result") or "").splitlines()[0]
+        line = f"🔧 `{e['name']}({e.get('order_id', '')})` {mark} {preview}".rstrip()
+        lines.append(line)
+    return "  \n".join(lines)
+
+
 def render_tools(msg):
     """显示这次问答调了哪些工具。
 
@@ -143,7 +171,8 @@ def render_tools(msg):
     if not tools:
         return
     for t in tools:
-        with st.expander(f"🔧 调用工具 {t['name']}({t['args']})"):
+        mark = _STATUS_MARK.get(t.get("status", "ok"), "•")
+        with st.expander(f"{mark} 调用工具 {t['name']}({t.get('order_id', '')})"):
             st.code(t["result"], language="text")
 
 
@@ -188,6 +217,11 @@ def render_message(msg):
             # 失败的消息只有错误说明，没有答题、引用、耗时可言
             st.error(msg["content"])
             return
+        if msg["role"] == "assistant":
+            # 重绘历史时也要有那行轨迹，否则刷一次页面"它查没查单"就看不见了
+            tools = (msg.get("info") or {}).get("tools") or []
+            if tools:
+                st.markdown(_event_lines(tools))
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
             render_metrics(msg)
@@ -241,16 +275,25 @@ def ask_and_render(question):
         st.markdown(question)
 
     with st.chat_message("assistant"):
+        # 过程区要在正文上方：先创建的先渲染，顺序反了轨迹会跑到答案下面
+        trace_box = st.empty()
         box = st.empty()
         box.markdown("_检索资料中…_")
         buf = []
+        events = []
+
+        def on_event(ev):
+            events.append(ev)
+            trace_box.markdown(_event_lines(events))
 
         def on_token(t):
             buf.append(t)
             box.markdown("".join(buf) + "▌")
 
         try:
-            info = rag.ask(question, show_retrieval=False, on_token=on_token)
+            info = rag.ask(
+                question, show_retrieval=False, on_token=on_token, on_event=on_event
+            )
         except Exception as e:
             # 不接这个异常，界面就是一段 traceback。
             # 而且外层紧接着会 st.rerun()，这一轮的即时渲染会被整片冲掉，

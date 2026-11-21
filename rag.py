@@ -195,6 +195,27 @@ def build_user_msg(context, question):
     return f"【今天】{_today()}\n\n【资料】\n{context}\n\n【问题】\n{question}"
 
 
+# ============ 索引 ============
+# 必须在这里先声明成 None。以前这两个名字只在 main() 里 global 赋值，
+# 模块加载后压根不存在 —— 界面靠 app.py 的 load_index() 补、命令行靠 main() 补，
+# 第三个入口（脚本 / 定时任务）一调 ask() 就 NameError: BM25，
+# 而报错位置在 retrieve() 里，跟真实原因隔了两层。
+CHUNKS = None            # [(来源, 片段文本), ...]
+BM25 = None              # rank_bm25 索引对象
+
+
+def ensure_index():
+    """索引没建就建。所有入口（界面 / 命令行 / 脚本）共用这一个。
+
+    返回 (片段数, 文档数)。重复调用无副作用 —— 建过就直接返回。
+    """
+    global CHUNKS, BM25
+    if CHUNKS is None or BM25 is None:
+        CHUNKS = R.load_chunks()
+        BM25 = R.build_index(CHUNKS)
+    return len(CHUNKS), len({s for s, _ in CHUNKS})
+
+
 # ============ 混合检索（BM25 + 向量，RRF 融合）============
 # 默认关闭：HYBRID=0 时行为和之前完全一致，先保证"没改坏"，再谈"改好了"。
 HYBRID = os.getenv("HYBRID", "0")
@@ -255,6 +276,8 @@ def retrieve(question):
     开启重排时候选池要放大到 CAND_K —— 只召回 3 个再重排，等于没有排序空间。
     """
     global RETRIEVE_MODE
+    # 兜底：任何入口进来的第一次检索都保证索引存在。两次 None 判断，成本可忽略。
+    ensure_index()
     want_k = CAND_K if RERANK == "1" else R.TOP_K
 
     if HYBRID == "1" and VECS is not None:
@@ -347,7 +370,11 @@ def _stream_once(client, messages, tools=None, on_token=None):
         c = getattr(d, "content", None)
         if c:
             if first_at is None:
-                first_at = time.perf_counter() - t_gen
+                # 记**绝对时间戳**，不是相对 t_gen 的差值。
+                # 以前这里写 perf_counter() - t_gen，而 t_gen 是在流建立之后才取的，
+                # 于是"首字耗时"实际是首个 chunk 到第二个 chunk 的间隔，界面上恒显示 0.00s
+                # —— 一个永远为零的指标比没有指标更糟，读者会以为模型一呼即应。
+                first_at = time.perf_counter()
             pieces.append(c)
             if on_token:
                 on_token(c)
@@ -376,26 +403,34 @@ def _dispatch_checked(T, call, question):
     这条判断比 schema 措辞硬：prompt 能劝，代码能拦，而这里连工具都还没进。
 
     成本只有一次字符串比对，不加 token、不加请求。
+
+    返回 (status, 文本)，status 供界面显示「✓ 已查到 / ✗ 被拦下」。
     """
     try:
         args = json.loads(call["arguments"] or "{}")
     except (json.JSONDecodeError, TypeError):
-        return T.dispatch(call["name"], call["arguments"])  # 参数不合法交给 dispatch 报错
+        return T.dispatch_ex(call["name"], call["arguments"])  # 参数不合法交给 dispatch 报错
 
     oid = (args.get("order_id") or "").strip().upper()
     if oid and oid not in question.upper():
-        return (
+        return "blocked", (
             f"用户没有提供订单号 {oid}。不要自己编造，也不要拿示例单号顶替 —— "
             "请先向用户询问他的订单号，拿到之后再查。"
         )
-    return T.dispatch(call["name"], call["arguments"])
+    return T.dispatch_ex(call["name"], call["arguments"])
 
 
-def _ask_with_tools(question, show_retrieval, emit, t0):
+def _ask_with_tools(question, show_retrieval, emit, t0, on_event=None):
     """带工具调用的问答。
 
     资料和工具同时给模型，让它自己选 —— 不做「这题该不该查订单」的规则判断。
     检索只花十几毫秒且不调模型，先跑一遍不影响什么；真正决定走哪条路的是模型。
+
+    on_event: 过程事件回调，给界面显示「在干什么」。目前两种：
+      {"type": "thinking"}                  模型正在判断要不要查单（这一步最耗时）
+      {"type": "tool", "name", "args",
+       "status", "preview"}                 某次工具调用的结果与状态
+    事件和正文走两个通道：正文可以被覆盖重绘，事件是要留痕的，混在一起迟早出错。
     """
     from openai import OpenAI
 
@@ -421,13 +456,19 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
     schema = T.TOOLS_SCHEMA
     t_gen = time.perf_counter()
 
+    # 第一次模型调用之前先说一声。这一段是整条链路里最长的空白（要等模型判断意图），
+    # 不说一声，界面就是提问后静默一两秒，看着像卡死。
+    if on_event:
+        on_event({"type": "thinking"})
+
     for _round in range(MAX_TOOL_ROUNDS):
         text, calls, usage, fa = _stream_once(client, messages, tools=schema, on_token=emit)
         if usage:
             inp += usage.prompt_tokens or 0
             out += usage.completion_tokens or 0
         if first_at is None and fa is not None:
-            first_at = fa
+            # fa 是绝对时间戳，换算成"从提问开始的等待秒数"
+            first_at = fa - t0
         pieces.append(text)
 
         if not calls:
@@ -448,8 +489,34 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
             }
         )
         for i, c in enumerate(calls):
-            result = _dispatch_checked(T, c, question)
-            trace.append({"name": c["name"], "args": c["arguments"], "result": result})
+            status, result = _dispatch_checked(T, c, question)
+            # 单号单独解出来：界面要显示"查了哪个单"，不该让前端再解析一遍 JSON
+            try:
+                _args = json.loads(c["arguments"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                _args = {}
+            oid = _args.get("order_id", "") if isinstance(_args, dict) else ""
+            trace.append(
+                {
+                    "name": c["name"],
+                    "args": c["arguments"],
+                    "result": result,
+                    "status": status,
+                    "order_id": oid,
+                }
+            )
+            if on_event:
+                on_event(
+                    {
+                        "type": "tool",
+                        "name": c["name"],
+                        "args": _args,
+                        "status": status,
+                        "order_id": oid,
+                        # 摘要取第一行：模型拿到的全文很长，界面上一行就够
+                        "preview": (result or "").splitlines()[0] if result else "",
+                    }
+                )
             if show_retrieval:
                 print(f"\n🔧 {c['name']}({c['arguments']})")
                 print("   " + result.replace("\n", "\n   "))
@@ -483,7 +550,8 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
         "mode": RETRIEVE_MODE,
         "tools": trace,
         "t_retrieval": t_retrieval,
-        "first_at": first_at if first_at is not None else t_total - t_gen,
+        # first_at 已在上面换算成相对提问起点的秒数；没有首字时退回总耗时
+        "first_at": first_at if first_at is not None else t_total,
         "t_total": t_total,
         "inp": inp,
         "out": out,
@@ -491,12 +559,14 @@ def _ask_with_tools(question, show_retrieval, emit, t0):
     }
 
 
-def ask(question, show_retrieval=True, on_token=None):
-    """一次完整的 RAG 问答。返回 (答案, 用量信息, 检索结果)。
+def ask(question, show_retrieval=True, on_token=None, on_event=None):
+    """一次完整的 RAG 问答，返回 dict。事件说明见 _ask_with_tools。
 
     on_token: 流式回调，收到就吐一个字符串片段。默认直接打到终端。
     界面（app.py）传自己的回调，这样流式逻辑只有这一份 ——
     复制一套到前端，两边迟早会对不上。
+
+    on_event: 过程事件。不开工具时不会有任何事件，传了也不会被调用。
     """
     from openai import OpenAI
 
@@ -506,7 +576,7 @@ def ask(question, show_retrieval=True, on_token=None):
     # 工具模式走另一条路径，但入口还是 ask —— CLI 和界面都不需要知道有没有工具，
     # 换的只是这一层的实现，不是调用方。
     if TOOLS == "1":
-        return _ask_with_tools(question, show_retrieval, emit, t0)
+        return _ask_with_tools(question, show_retrieval, emit, t0, on_event)
 
     # ---------- 第 1 步：检索 ----------
     hits = retrieve(question)
@@ -556,12 +626,18 @@ def ask(question, show_retrieval=True, on_token=None):
         c = getattr(d, "content", None)
         if c:
             if first_at is None:
-                first_at = time.perf_counter() - t_gen
+                # 记**绝对时间戳**，不是相对 t_gen 的差值。
+                # 以前这里写 perf_counter() - t_gen，而 t_gen 是在流建立之后才取的，
+                # 于是"首字耗时"实际是首个 chunk 到第二个 chunk 的间隔，界面上恒显示 0.00s
+                # —— 一个永远为零的指标比没有指标更糟，读者会以为模型一呼即应。
+                first_at = time.perf_counter()
             pieces.append(c)
             emit(c)
 
     answer = "".join(pieces)
     t_total = time.perf_counter() - t0
+    if first_at is not None:
+        first_at -= t0      # 绝对时间戳 → 从提问起算的等待秒数
     inp = usage.prompt_tokens if usage else 0
     out = usage.completion_tokens if usage else 0
     cost = inp / 1e6 * PRICE_IN + out / 1e6 * PRICE_OUT
@@ -572,7 +648,8 @@ def ask(question, show_retrieval=True, on_token=None):
         "mode": RETRIEVE_MODE,   # 实际生效的检索方式（降级后会变），界面按这个显示
         "tools": [],             # 未开工具时恒为空，界面不用判空分支
         "t_retrieval": t_retrieval,
-        "first_at": first_at if first_at is not None else t_total - t_gen,
+        # first_at 已在上面换算成相对提问起点的秒数；没有首字时退回总耗时
+        "first_at": first_at if first_at is not None else t_total,
         "t_total": t_total,
         "inp": inp,
         "out": out,
@@ -765,8 +842,6 @@ def run_golden():
 
 
 def main():
-    global CHUNKS, BM25
-
     if not API_KEY:
         print("没有找到 API_KEY，先设一下：")
         print('  PowerShell:  $env:API_KEY="sk-你的key"')
@@ -774,9 +849,8 @@ def main():
         return
 
     # 建一次索引，反复用
-    CHUNKS = R.load_chunks()
-    BM25 = R.build_index(CHUNKS)
-    print(f"知识库：{len(set(s for s, _ in CHUNKS))} 份文档，{len(CHUNKS)} 个片段")
+    n_chunks, n_docs = ensure_index()
+    print(f"知识库：{n_docs} 份文档，{n_chunks} 个片段")
     print(f"模型：{MODEL}  思考：{'开' if THINK == '1' else '关'}")
 
     # 混合检索：启用时才算向量；算不出来就降级，不让整个问答挂掉
