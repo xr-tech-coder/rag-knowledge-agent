@@ -192,6 +192,17 @@ def run_golden(bm25, chunks):
     print("\n上面三个数（通过率 / top1 / 平均取回字数）就是你的基线。")
     print("以后每改一处（切分/加向量/加重排），回来跑一次对比。")
 
+    # 返回值给 CI 用：打印是给人看的，退出码得靠数字算。
+    # 不在这里 sys.exit —— 命令行交互时不应该因为一次低分就中断。
+    return {
+        "n_in": n_in,
+        "n_pass": n_in_ok,
+        "n_top1": n_top1_ok,
+        "avg_chars": vol_total // n_in if n_in else 0,
+        "n_refuse": n_out,
+        "gap": (in_min_top1 - max(out_top1)) if (in_min_top1 is not None and out_top1) else None,
+    }
+
 
 def main():
     chunks = load_chunks()
